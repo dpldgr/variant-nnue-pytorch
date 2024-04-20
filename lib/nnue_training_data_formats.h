@@ -56,8 +56,6 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include "../variant.h"
 
-#define DATA_SIZE 512
-
 static_assert(DATA_SIZE % 8 == 0);
 
 namespace chess
