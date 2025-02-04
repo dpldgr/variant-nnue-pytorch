@@ -597,26 +597,76 @@ namespace binpack
             int bits; // How many bits do you have
         };
 
+        constexpr int huffman_bits = PIECE_TYPES_BITS + 1;
+
         // NOTE: Order adjusted for this library because originally NO_PIECE had index 0
         constexpr HuffmanedPiece huffman_table[] =
         {
-            {0b00000,1}, // NO_PIECE
-            {0b00001,5}, // PAWN
-            {0b00011,5}, // KNIGHT
-            {0b00101,5}, // BISHOP
-            {0b00111,5}, // ROOK
-            {0b01001,5}, // QUEEN
-            {0b01011,5}, //
-            {0b01101,5}, //
-            {0b01111,5}, //
-            {0b10001,5}, //
-            {0b10011,5}, //
-            {0b10101,5}, //
-            {0b10111,5}, //
-            {0b11001,5}, //
-            {0b11011,5}, //
-            {0b11101,5}, //
-            {0b11111,5}, //
+            {0b0000000,1}, // NO_PIECE
+            {0b0000001,huffman_bits}, // PAWN
+            {0b0000011,huffman_bits}, // KNIGHT
+            {0b0000101,huffman_bits}, // BISHOP
+            {0b0000111,huffman_bits}, // ROOK
+            {0b0001001,huffman_bits}, // QUEEN
+            {0b0001011,huffman_bits}, //
+            {0b0001101,huffman_bits}, //
+            {0b0001111,huffman_bits}, //
+            {0b0010001,huffman_bits}, //
+            {0b0010011,huffman_bits}, //
+            {0b0010101,huffman_bits}, //
+            {0b0010111,huffman_bits}, //
+            {0b0011001,huffman_bits}, //
+            {0b0011011,huffman_bits}, //
+            {0b0011101,huffman_bits}, //
+            {0b0011111,huffman_bits}, //
+            {0b0100001,huffman_bits}, //
+            {0b0100011,huffman_bits}, //
+            {0b0100101,huffman_bits}, //
+            {0b0100111,huffman_bits}, //
+            {0b0101001,huffman_bits}, //
+            {0b0101011,huffman_bits}, //
+            {0b0101101,huffman_bits}, //
+            {0b0101111,huffman_bits}, //
+            {0b0110001,huffman_bits}, //
+            {0b0110011,huffman_bits}, //
+            {0b0110101,huffman_bits}, //
+            {0b0110111,huffman_bits}, //
+            {0b0111001,huffman_bits}, //
+            {0b0111011,huffman_bits}, //
+            {0b0111101,huffman_bits}, //
+            {0b0111111,huffman_bits}, //
+            {0b1000001,huffman_bits}, //
+            {0b1000011,huffman_bits}, //
+            {0b1000101,huffman_bits}, //
+            {0b1000111,huffman_bits}, //
+            {0b1001001,huffman_bits}, //
+            {0b1001011,huffman_bits}, //
+            {0b1001101,huffman_bits}, //
+            {0b1001111,huffman_bits}, //
+            {0b1010001,huffman_bits}, //
+            {0b1010011,huffman_bits}, //
+            {0b1010101,huffman_bits}, //
+            {0b1010111,huffman_bits}, //
+            {0b1011001,huffman_bits}, //
+            {0b1011011,huffman_bits}, //
+            {0b1011101,huffman_bits}, //
+            {0b1011111,huffman_bits}, //
+            {0b1100001,huffman_bits}, //
+            {0b1100011,huffman_bits}, //
+            {0b1100101,huffman_bits}, //
+            {0b1100111,huffman_bits}, //
+            {0b1101001,huffman_bits}, //
+            {0b1101011,huffman_bits}, //
+            {0b1101101,huffman_bits}, //
+            {0b1101111,huffman_bits}, //
+            {0b1110001,huffman_bits}, //
+            {0b1110011,huffman_bits}, //
+            {0b1110101,huffman_bits}, //
+            {0b1110111,huffman_bits}, //
+            {0b1111001,huffman_bits}, //
+            {0b1111011,huffman_bits}, //
+            {0b1111101,huffman_bits}, //
+            {0b1111111,huffman_bits}, //
         };
 
         // Class for compressing/decompressing sfen
@@ -653,7 +703,7 @@ namespace binpack
                     code |= stream.read_one_bit() << bits;
                     ++bits;
 
-                    assert(bits <= 6);
+                    assert(bits <= (huffman_bits+1));
 
                     for (pr = 0; pr <= static_cast<int>(chess::PieceType::None); ++pr)
                         if (huffman_table[pr].code == code
