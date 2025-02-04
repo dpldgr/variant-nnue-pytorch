@@ -705,7 +705,7 @@ namespace binpack
 
                     assert(bits <= (huffman_bits+1));
 
-                    for (pr = 0; pr <= static_cast<int>(chess::PieceType::None); ++pr)
+                    for (pr = 0; pr <= (1<<PIECE_TYPES_BITS); ++pr)
                         if (huffman_table[pr].code == code
                             && huffman_table[pr].bits == bits)
                             goto Found;
