@@ -1,12 +1,12 @@
 import argparse
 import model as M
 import nnue_dataset
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import features
 import os
 import torch
 from torch import set_num_threads as t_set_num_threads
-from pytorch_lightning import loggers as pl_loggers
+from lightning.pytorch import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
 def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size):
@@ -21,11 +21,59 @@ def make_data_loaders(train_filename, val_filename, feature_set, num_workers, ba
   val = DataLoader(nnue_dataset.FixedNumBatchesDataset(val_infinite, (val_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
   return train, val
 
+def add_trainer_args(parser):
+  parser.add_argument("--gpus", type=int, default=None, dest="gpus", help="Number of gpus to use. Kept for backwards compatibility.")
+  parser.add_argument("--devices", type=int, default=None, dest="devices", help="Number of devices to use (Lightning 2.x).")
+  parser.add_argument("--accelerator", type=str, default=None, dest="accelerator", help="Accelerator type to use (cpu/gpu/auto).")
+  parser.add_argument("--max_epochs", type=int, default=None, dest="max_epochs", help="Stop training once this number of epochs is reached.")
+  parser.add_argument("--min_epochs", type=int, default=None, dest="min_epochs", help="Force training for at least this number of epochs.")
+  parser.add_argument("--default_root_dir", type=str, default=None, dest="default_root_dir", help="Default path for logs and weights.")
+  parser.add_argument("--precision", type=str, default=None, dest="precision", help="Precision mode to use (e.g. 32, 16, bf16).")
+  parser.add_argument("--log_every_n_steps", type=int, default=None, dest="log_every_n_steps", help="How often to log within steps.")
+  parser.add_argument("--check_val_every_n_epoch", type=int, default=None, dest="check_val_every_n_epoch", help="How often to run validation.")
+  parser.add_argument("--val_check_interval", type=float, default=None, dest="val_check_interval", help="How often to check validation within an epoch.")
+  parser.add_argument("--limit_train_batches", type=float, default=None, dest="limit_train_batches", help="Fraction/number of training batches to use.")
+  parser.add_argument("--limit_val_batches", type=float, default=None, dest="limit_val_batches", help="Fraction/number of validation batches to use.")
+  parser.add_argument("--accumulate_grad_batches", type=int, default=None, dest="accumulate_grad_batches", help="Accumulate gradients over k batches.")
+  parser.add_argument("--gradient_clip_val", type=float, default=None, dest="gradient_clip_val", help="Clip gradients at this value.")
+  return parser
+
+def build_trainer_kwargs(args):
+  trainer_kwargs = {}
+  if args.gpus is not None:
+    if args.gpus > 0:
+      trainer_kwargs["accelerator"] = args.accelerator or "gpu"
+      trainer_kwargs["devices"] = args.gpus
+    else:
+      trainer_kwargs["accelerator"] = args.accelerator or "cpu"
+      trainer_kwargs["devices"] = 1
+  if args.devices is not None:
+    trainer_kwargs["devices"] = args.devices
+  if args.accelerator is not None:
+    trainer_kwargs["accelerator"] = args.accelerator
+  for key in (
+    "max_epochs",
+    "min_epochs",
+    "default_root_dir",
+    "precision",
+    "log_every_n_steps",
+    "check_val_every_n_epoch",
+    "val_check_interval",
+    "limit_train_batches",
+    "limit_val_batches",
+    "accumulate_grad_batches",
+    "gradient_clip_val",
+  ):
+    value = getattr(args, key)
+    if value is not None:
+      trainer_kwargs[key] = value
+  return trainer_kwargs
+
 def main():
   parser = argparse.ArgumentParser(description="Trains the network.")
   parser.add_argument("train", help="Training data (.bin)")
   parser.add_argument("val", help="Validation data (.bin)")
-  parser = pl.Trainer.add_argparse_args(parser)
+  parser = add_trainer_args(parser)
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for bin.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
@@ -85,14 +133,15 @@ def main():
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
   checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True, every_n_epochs=1, save_top_k=-1)
-  trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
+  trainer_kwargs = build_trainer_kwargs(args)
+  trainer = pl.Trainer(callbacks=[checkpoint_callback], logger=tb_logger, **trainer_kwargs)
 
-  main_device = trainer.strategy.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
+  main_device = str(trainer.strategy.root_device)
 
   print('Using c++ data loader')
   train, val = make_data_loaders(args.train, args.val, feature_set, args.num_workers, batch_size, not args.no_smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.validation_size)
 
-  trainer.fit(nnue, train, val)
+  trainer.fit(nnue, train_dataloaders=train, val_dataloaders=val)
 
 if __name__ == '__main__':
   main()
