@@ -6,7 +6,7 @@ import numpy
 import struct
 import torch
 from torch import nn
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from torch.utils.data import DataLoader
 from functools import reduce
 import operator
