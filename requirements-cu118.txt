@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.7.1+cu118
+cupy-cuda11x
+pytorch-lightning==2.5.6
+chess
+matplotlib
+tensorboard

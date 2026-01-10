@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.9.1+cu130
+cupy-cuda13x
+pytorch-lightning==2.5.6
+chess
+matplotlib
+tensorboard
