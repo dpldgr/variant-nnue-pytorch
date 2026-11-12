@@ -86,6 +86,14 @@ int main() {
         PrpSfenInputStream all_skipped(std::make_unique<MemorySource>(17), 42, 0,
             [](const bin::TrainingDataEntry&) { return true; });
         check(!all_skipped.next() && all_skipped.eof(), "all-skipped epoch did not finish");
+        int legacy_calls=0;
+        IndexedSequentialInputStream legacy(std::make_unique<MemorySource>(3),true,
+            [&](const bin::TrainingDataEntry&){return ++legacy_calls<6;},true);
+        auto legacy_value=legacy.next();
+        check(legacy_value && legacy_value->score==2 && legacy_calls==6,"legacy cyclic skip/reopen semantics changed");
+        IndexedSequentialInputStream compact(std::make_unique<MemorySource>(3),true,
+            [](const bin::TrainingDataEntry&){return true;});
+        check(!compact.next(),"compact all-skipped traversal did not finish");
         std::cout << "PRP permutation, inverse, indexed backend and finite-epoch tests passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

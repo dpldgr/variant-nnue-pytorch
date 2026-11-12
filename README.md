@@ -24,7 +24,9 @@ PyTorch with CUDA 11.8 will be automatically installed, along with the matching 
 If your GPU is CUDA 12.8 capable you can use requirements-CUDA128.txt instead of requirements.txt
 
 #### Build the fast DataLoader
-This requires a C++17 compiler and cmake.
+On this branch, install the prebuilt library for your platform beside
+`nnue_dataset.py`; no per-variant compilation is needed. The commands below are
+for development builds and require a C++17 compiler and CMake.
 
 Windows:
 ```
@@ -35,6 +37,22 @@ Linux/Mac:
 ```
 sh compile_data_loader.bat
 ```
+
+# Runtime variant configuration
+
+The `generic_data_loader` branch uses one prebuilt native library and a JSON
+configuration instead of rebuilding the library for each variant. Install the
+matching Windows DLL, Linux `.so` or macOS `.dylib` beside `nnue_dataset.py`.
+CMake/compiler tools are needed only for development builds.
+
+```sh
+python train.py train.bin val.bin --variant-config configs/metal-chess.json --data-loader prp
+```
+
+The default is `variant.json`; new checkpoints retain their configuration.
+Existing loader options and NNUE file format are preserved. See
+[generic loader usage, conversion and development notes](docs/generic_loader.md).
+Do not overwrite the new runtime `variant.py` module with generated constants.
 
 # Train a network
 

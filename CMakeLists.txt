@@ -1,14 +1,10 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.20)
 
 project(training_data_loader)
 
-if(NOT DEFINED CMAKE_BUILD_TYPE)
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
-
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O3")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED 17)
@@ -33,4 +29,7 @@ if(BUILD_PRP_TESTS)
   add_executable(test_compact_record tests/test_compact_record.cpp)
   target_include_directories(test_compact_record PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME compact_record COMMAND test_compact_record)
+  add_executable(test_generic_native tests/test_generic_native.cpp)
+  target_link_libraries(test_generic_native Threads::Threads)
+  add_test(NAME generic_native COMMAND test_generic_native)
 endif()

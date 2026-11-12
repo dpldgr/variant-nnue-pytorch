@@ -1,0 +1,15 @@
+{
+  "RANKS": 8,
+  "FILES": 8,
+  "KING_SQUARES": 64,
+  "PIECE_TYPES": 6,
+  "PIECE_COUNT": 32,
+  "USE_POCKETS": false,
+  "PIECE_VALUES": {
+    "1": 126,
+    "2": 2538,
+    "3": 1506,
+    "4": 1166,
+    "5": 1093
+  }
+}

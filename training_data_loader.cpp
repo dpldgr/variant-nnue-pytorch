@@ -12,375 +12,191 @@
 #include <exception>
 #include <condition_variable>
 #include <atomic>
+#include <climits>
+#include <stdexcept>
 
 #include "lib/nnue_training_data_formats.h"
 #include "lib/nnue_training_data_stream.h"
 #include "lib/rng.h"
 #include "lib/prp_training_data_stream.h"
 
-#if defined (__x86_64__)
-#define EXPORT
-#define CDECL
-#else
-#if defined (_MSC_VER)
+#if defined(_WIN32)
 #define EXPORT __declspec(dllexport)
 #define CDECL __cdecl
 #else
 #define EXPORT
-#define CDECL __attribute__ ((__cdecl__))
-#endif
+#define CDECL
 #endif
 
 using namespace bin;
 using namespace chess;
 
-static constexpr int MAX_PIECES = PIECE_COUNT;
-static constexpr int MAX_HAND_PIECES = POCKETS ? 2 * static_cast<int>(File::FILE_NB) : 0;
-
-static Square orient(Color color, Square sq)
-{
-    if (color == Color::White)
-    {
-        return sq;
+// Compile-time feature-family selection, runtime variant configuration.
+enum class Family { KP, KPF, KA, KAF, V2, V2F };
+template <Family F> struct RuntimeFeatures {
+    training_data::VariantPtr config;
+    int INPUTS, MAX_ACTIVE_FEATURES;
+    unsigned planes, base_inputs, virtual_board, pt_real;
+    std::vector<unsigned> offsets;
+    explicit RuntimeFeatures(training_data::VariantPtr cfg) : config(std::move(cfg)) {
+        const auto &c = *config;
+        constexpr bool kp = F == Family::KP || F == Family::KPF;
+        constexpr bool v2 = F == Family::V2 || F == Family::V2F;
+        constexpr bool factor = F == Family::KPF || F == Family::KAF || F == Family::V2F;
+        pt_real = 2 * c.PIECE_TYPES - (kp ? 2u : (v2 && c.KING_SQUARES > 1 ? 1u : 0u));
+        std::uint64_t plane =
+            std::uint64_t(c.squares) * pt_real +
+            (v2 ? std::uint64_t(c.hand_capacity) * (pt_real - unsigned(c.KING_SQUARES > 1)) : 1);
+        std::uint64_t base = plane * (v2 ? c.KING_SQUARES : c.squares);
+        std::uint64_t extra = kp ? std::uint64_t(c.squares) * (pt_real + 1)
+                                 : std::uint64_t(c.squares) * 2 * c.PIECE_TYPES +
+                                       (v2 ? std::uint64_t(c.hand_capacity) *
+                                                 (2 * c.PIECE_TYPES - 2 * unsigned(c.KING_SQUARES > 1))
+                                           : 0);
+        if (plane > INT_MAX || base + (factor ? extra : 0) > INT_MAX)
+            throw std::invalid_argument("Variant feature dimensions exceed int32 feature IDs");
+        planes = unsigned(plane);
+        base_inputs = unsigned(base);
+        virtual_board = c.squares * 2 * c.PIECE_TYPES;
+        INPUTS = int(base + (factor ? extra : 0));
+        MAX_ACTIVE_FEATURES = int(c.PIECE_COUNT * (factor ? 2 : 1) + (F == Family::KPF ? 1 : 0));
+        offsets.resize(2 * c.PIECE_TYPES);
+        for (unsigned p = 0; p < offsets.size(); ++p)
+            offsets[p] = ((v2 && pt_real % 2 && p == pt_real) ? p - 1 : p) * c.squares;
     }
-    else
-    {
-        // IMPORTANT: for now we use rotate180 instead of rank flip
-        //            for compatibility with the stockfish master branch.
-        //            Note that this is inconsistent with nodchip/master.
-        return flip_horizontally(flip_vertically(sq));
-    }
-}
-
-static Square orient_flip(Color color, Square sq)
-{
-    if (sq == Square::NB)
-        // map missing king to zero
-        return Square::MIN;
-    if (color == Color::White)
-    {
-        return sq;
-    }
-    else
-    {
-        return flip_vertically(sq);
-    }
-}
-
-static int map_king(Square sq)
-{
-    // palace squares for Xiangi/Janggi
-    // map accessible king squares skipping the gaps
-    if (Square::KNB == Square(9) && Square::KNB != Square::NB)
-        return (int(sq) - 6 * (int(sq) / int(File::FILE_NB)) - 3) % int(Square::KNB);
-
-    return int(sq) % int(Square::KNB);
-}
-
-struct HalfKP {
-    static constexpr int NUM_SQ = static_cast<int>(Square::NB);
-    static constexpr int NUM_PT = static_cast<int>(PieceType::MaxPiece) * 2;
-    static constexpr int NUM_PLANES = (NUM_SQ * NUM_PT + 1);
-    static constexpr int INPUTS = NUM_PLANES * NUM_SQ;
-
-    static constexpr int MAX_ACTIVE_FEATURES = MAX_PIECES;
-
-    static int feature_index(Color color, Square ksq, Square sq, Piece p)
-    {
-        auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
-        return 1 + static_cast<int>(orient(color, sq)) + p_idx * NUM_SQ + map_king(ksq) * NUM_PLANES;
-    }
-
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        auto& pos = e.pos;
-        auto ksq = pos.kingSquare(color);
-
-        // We order the features so that the resulting sparse
-        // tensor is coalesced.
+    std::pair<int, int> fill_features_sparse(const TrainingDataEntry &e, int *ids, float *values,
+                                             Color color) const {
+        const auto &c = *config;
+        const auto &pos = e.pos;
+        const unsigned pov = unsigned(color);
+        constexpr bool kp = F == Family::KP || F == Family::KPF;
+        constexpr bool v2 = F == Family::V2 || F == Family::V2F;
+        const auto &orientation = pov ? (kp ? c.rotate : c.flip) : c.identity;
+        unsigned king = orientation[pos.kingSquare(color)];
+        unsigned mapped = c.king_map[king];
+        if (mapped >= c.KING_SQUARES)
+            throw std::runtime_error("King outside configured reference-square mapping");
+        unsigned anchor = mapped * planes;
         int j = 0;
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
-        {
-            auto p = pos.pieceAt(sq);
-            if (p == Piece::None || type_of(p) == PieceType::King)
+        for (unsigned sq = 0; sq < c.squares; ++sq) {
+            auto p = pos.board[sq];
+            if (p == chess::NoPiece || (kp && chess::type_of(p) == c.king_type))
                 continue;
-            values[j] = 1.0f;
-            features[j] = feature_index(color, orient(color, ksq), sq, p);
-            ++j;
+            unsigned plane = offsets[unsigned(p) ^ pov];
+            ids[j] = int((v2 ? 0u : 1u) + orientation[sq] + plane + anchor);
+            values[j++] = 1.0f;
         }
-
-        return { j, INPUTS };
-    }
-};
-
-struct HalfKPFactorized {
-    // Factorized features
-    static constexpr int K_INPUTS = HalfKP::NUM_SQ;
-    static constexpr int PIECE_INPUTS = HalfKP::NUM_SQ * HalfKP::NUM_PT;
-    static constexpr int INPUTS = HalfKP::INPUTS + K_INPUTS + PIECE_INPUTS;
-
-    static constexpr int MAX_K_FEATURES = 1;
-    static constexpr int MAX_PIECE_FEATURES = MAX_PIECES;
-    static constexpr int MAX_ACTIVE_FEATURES = HalfKP::MAX_ACTIVE_FEATURES + MAX_K_FEATURES + MAX_PIECE_FEATURES;
-
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        auto [start_j, offset] = HalfKP::fill_features_sparse(e, features, values, color);
-        int j = start_j;
-        auto& pos = e.pos;
-        {
-            // king square factor
-            auto ksq = pos.kingSquare(color);
-            features[j] = offset + static_cast<int>(orient(color, ksq));
-            values[j] = static_cast<float>(start_j);
-            ++j;
-        }
-        offset += K_INPUTS;
-
-        // We order the features so that the resulting sparse
-        // tensor is coalesced. Note that we can just sort
-        // the parts where values are all 1.0f and leave the
-        // halfk feature where it was.
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
-        {
-            auto p = pos.pieceAt(sq);
-            if (p == Piece::None || type_of(p) == PieceType::King)
-                continue;
-            auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
-            values[j] = 1.0f;
-            features[j] = offset + (p_idx * HalfKP::NUM_SQ) + static_cast<int>(orient(color, sq));
-            ++j;
-        }
-
-        return { j, INPUTS };
-    }
-};
-
-struct HalfKA {
-    static constexpr int NUM_SQ = static_cast<int>(Square::NB);
-    static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2;
-    static constexpr int NUM_PLANES = (NUM_SQ * NUM_PT + 1);
-    static constexpr int INPUTS = NUM_PLANES * NUM_SQ;
-
-    static constexpr int MAX_ACTIVE_FEATURES = MAX_PIECES;
-
-    static int feature_index(Color color, Square ksq, Square sq, Piece p)
-    {
-        auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
-        return 1 + static_cast<int>(orient_flip(color, sq)) + p_idx * NUM_SQ + map_king(ksq) * NUM_PLANES;
-    }
-
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        auto& pos = e.pos;
-        auto ksq = pos.kingSquare(color);
-
-        int j = 0;
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
-        {
-            auto p = pos.pieceAt(sq);
-            if (p == Piece::None)
-                continue;
-            values[j] = 1.0f;
-            features[j] = feature_index(color, orient_flip(color, ksq), sq, p);
-            ++j;
-        }
-
-        return { j, INPUTS };
-    }
-};
-
-struct HalfKAFactorized {
-    // Factorized features
-    static constexpr int PIECE_INPUTS = HalfKA::NUM_SQ * HalfKA::NUM_PT;
-    static constexpr int INPUTS = HalfKA::INPUTS + PIECE_INPUTS;
-
-    static constexpr int MAX_PIECE_FEATURES = MAX_PIECES;
-    static constexpr int MAX_ACTIVE_FEATURES = HalfKA::MAX_ACTIVE_FEATURES + MAX_PIECE_FEATURES;
-
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        const auto [start_j, offset] = HalfKA::fill_features_sparse(e, features, values, color);
-        auto& pos = e.pos;
-
-        int j = start_j;
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
-        {
-            auto p = pos.pieceAt(sq);
-            if (p == Piece::None)
-                continue;
-            auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
-            values[j] = 1.0f;
-            features[j] = offset + (p_idx * HalfKA::NUM_SQ) + static_cast<int>(orient_flip(color, sq));
-            ++j;
-        }
-
-        return { j, INPUTS };
-    }
-};
-
-struct HalfKAv2 {
-    static constexpr int NUM_KSQ = static_cast<int>(Square::KNB);
-    static constexpr int NUM_SQ = static_cast<int>(Square::NB);
-    static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2 - (NUM_KSQ > 1);
-    static constexpr int NUM_PLANES = NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - (NUM_KSQ > 1));
-    static constexpr int INPUTS = NUM_PLANES * NUM_KSQ;
-
-    static constexpr int MAX_ACTIVE_FEATURES = MAX_PIECES;
-
-    static int feature_index(Color color, Square ksq, Square sq, Piece p)
-    {
-        auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
-        if (NUM_PT % 2 && p_idx == NUM_PT)
-            --p_idx; // pack the opposite king into the same NUM_SQ * NUM_SQ
-        return static_cast<int>(orient_flip(color, sq)) + p_idx * NUM_SQ + map_king(ksq) * NUM_PLANES;
-    }
-
-    static int feature_index(Color color, Square ksq, int handCount, Piece p)
-    {
-        auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
-        return handCount + p_idx * MAX_HAND_PIECES + NUM_SQ * NUM_PT + map_king(ksq) * NUM_PLANES;
-    }
-
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        auto& pos = e.pos;
-        auto ksq = pos.kingSquare(color);
-
-        int j = 0;
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
-        {
-            auto p = pos.pieceAt(sq);
-            if (p == Piece::None)
-                continue;
-            values[j] = 1.0f;
-            features[j] = feature_index(color, orient_flip(color, ksq), sq, p);
-            ++j;
-        }
-
-        for (PieceType pt = PieceType::Pawn; pt < PieceType::King; ++pt)
-            for (Color c : { Color::White, Color::Black })
-                for (int i = 0; i < pos.getHandCount(make_piece(pt, c)); i++)
-                {
-                    values[j] = 1.0f;
-                    features[j] = feature_index(color, orient_flip(color, ksq), i, make_piece(pt, c));
-                    ++j;
+        if constexpr (v2) {
+            for (unsigned type = 0; type < c.king_type; ++type)
+                for (unsigned owner = 0; owner < 2; ++owner) {
+                    unsigned pc = 2 * type + owner;
+                    for (unsigned n = 0; n < pos.hands[pc]; ++n) {
+                        ids[j] = int(n + (pc ^ pov) * c.hand_capacity + c.squares * pt_real + anchor);
+                        values[j++] = 1.0f;
+                    }
                 }
-
-        return { j, INPUTS };
-    }
-};
-
-struct HalfKAv2Factorized {
-    // Factorized features
-    static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2;
-    static constexpr int PIECE_INPUTS = HalfKAv2::NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - 2 * (HalfKAv2::NUM_KSQ > 1));
-    static constexpr int INPUTS = HalfKAv2::INPUTS + PIECE_INPUTS;
-
-    static constexpr int MAX_PIECE_FEATURES = MAX_PIECES;
-    static constexpr int MAX_ACTIVE_FEATURES = HalfKAv2::MAX_ACTIVE_FEATURES + MAX_PIECE_FEATURES;
-
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        const auto [start_j, offset] = HalfKAv2::fill_features_sparse(e, features, values, color);
-        auto& pos = e.pos;
-
-        int j = start_j;
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
-        {
-            auto p = pos.pieceAt(sq);
-            if (p == Piece::None)
-                continue;
-            auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
-            values[j] = 1.0f;
-            features[j] = offset + (p_idx * HalfKAv2::NUM_SQ) + static_cast<int>(orient_flip(color, sq));
+        }
+        if constexpr (F == Family::KPF) {
+            ids[j] = int(base_inputs + king);
+            values[j] = float(j);
             ++j;
         }
-
-        for (PieceType pt = PieceType::Pawn; pt < PieceType::King; ++pt)
-            for (Color c : { Color::White, Color::Black })
-                for (int i = 0; i < pos.getHandCount(make_piece(pt, c)); i++)
-                {
-                    values[j] = 1.0f;
-                    auto p_idx = static_cast<int>(pt) * 2 + (c != color);
-                    features[j] = offset + i + p_idx * MAX_HAND_PIECES + HalfKAv2::NUM_SQ * NUM_PT;
-                    ++j;
-                }
-
-        return { j, INPUTS };
+        if constexpr (F == Family::KPF || F == Family::KAF || F == Family::V2F) {
+            unsigned extra = base_inputs + (kp ? c.squares : 0);
+            for (unsigned sq = 0; sq < c.squares; ++sq) {
+                auto p = pos.board[sq];
+                if (p == chess::NoPiece || (kp && chess::type_of(p) == c.king_type))
+                    continue;
+                ids[j] = int(extra + (unsigned(p) ^ pov) * c.squares + orientation[sq]);
+                values[j++] = 1.0f;
+            }
+            if constexpr (v2) {
+                for (unsigned type = 0; type < c.king_type; ++type)
+                    for (unsigned owner = 0; owner < 2; ++owner) {
+                        unsigned pc = 2 * type + owner;
+                        for (unsigned n = 0; n < pos.hands[pc]; ++n) {
+                            ids[j] = int(extra + virtual_board + n + (pc ^ pov) * c.hand_capacity);
+                            values[j++] = 1.0f;
+                        }
+                    }
+            }
+        }
+        return {j, INPUTS};
     }
 };
 
-template <typename T, typename... Ts>
-struct FeatureSet
-{
-    static_assert(sizeof...(Ts) == 0, "Currently only one feature subset supported.");
-
-    static constexpr int INPUTS = T::INPUTS;
-    static constexpr int MAX_ACTIVE_FEATURES = T::MAX_ACTIVE_FEATURES;
-
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        return T::fill_features_sparse(e, features, values, color);
-    }
-};
-
-struct SparseBatch
-{
+struct SparseBatch {
     static constexpr bool IS_BATCH = true;
 
-    template <typename... Ts>
-    SparseBatch(FeatureSet<Ts...>, const std::vector<TrainingDataEntry>& entries)
-    {
-        num_inputs = FeatureSet<Ts...>::INPUTS;
+    template <typename FeatureSetT>
+    SparseBatch(const FeatureSetT &fs, const std::vector<TrainingDataEntry> &entries) {
+        num_inputs = fs.INPUTS;
         size = entries.size();
-        is_white = new float[size];
-        outcome = new float[size];
-        score = new float[size];
-        white = new int[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
-        black = new int[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
-        white_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
-        black_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
-        psqt_indices = new int[size];
-        layer_stack_indices = new int[size];
+        const std::size_t slots = std::size_t(size) * fs.MAX_ACTIVE_FEATURES;
+        // Keep constructor failures exception-safe without changing batch ABI.
+        auto own_is_white = std::unique_ptr<float[]>(new float[size]);
+        auto own_outcome = std::unique_ptr<float[]>(new float[size]);
+        auto own_score = std::unique_ptr<float[]>(new float[size]);
+        auto own_white = std::unique_ptr<int[]>(new int[slots]);
+        auto own_black = std::unique_ptr<int[]>(new int[slots]);
+        auto own_white_values = std::unique_ptr<float[]>(new float[slots]);
+        auto own_black_values = std::unique_ptr<float[]>(new float[slots]);
+        auto own_psqt = std::unique_ptr<int[]>(new int[size]);
+        auto own_stack = std::unique_ptr<int[]>(new int[size]);
+        is_white = own_is_white.get();
+        outcome = own_outcome.get();
+        score = own_score.get();
+        white = own_white.get();
+        black = own_black.get();
+        white_values = own_white_values.get();
+        black_values = own_black_values.get();
+        psqt_indices = own_psqt.get();
+        layer_stack_indices = own_stack.get();
 
         num_active_white_features = 0;
         num_active_black_features = 0;
-        max_active_features = FeatureSet<Ts...>::MAX_ACTIVE_FEATURES;
+        max_active_features = fs.MAX_ACTIVE_FEATURES;
 
-        for (std::size_t i = 0; i < size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES; ++i)
+        for (std::size_t i = 0; i < slots; ++i)
             white[i] = -1;
-        for (std::size_t i = 0; i < size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES; ++i)
+        for (std::size_t i = 0; i < slots; ++i)
             black[i] = -1;
-        for (std::size_t i = 0; i < size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES; ++i)
+        for (std::size_t i = 0; i < slots; ++i)
             white_values[i] = 0.0f;
-        for (std::size_t i = 0; i < size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES; ++i)
+        for (std::size_t i = 0; i < slots; ++i)
             black_values[i] = 0.0f;
 
-        for(int i = 0; i < entries.size(); ++i)
-        {
-            fill_entry(FeatureSet<Ts...>{}, i, entries[i]);
+        for (int i = 0; i < entries.size(); ++i) {
+            fill_entry(fs, i, entries[i]);
         }
+        own_is_white.release();
+        own_outcome.release();
+        own_score.release();
+        own_white.release();
+        own_black.release();
+        own_white_values.release();
+        own_black_values.release();
+        own_psqt.release();
+        own_stack.release();
     }
 
     int num_inputs;
     int size;
 
-    float* is_white;
-    float* outcome;
-    float* score;
+    float *is_white;
+    float *outcome;
+    float *score;
     int num_active_white_features;
     int num_active_black_features;
     int max_active_features;
-    int* white;
-    int* black;
-    float* white_values;
-    float* black_values;
-    int* psqt_indices;
-    int* layer_stack_indices;
+    int *white;
+    int *black;
+    float *white_values;
+    float *black_values;
+    int *psqt_indices;
+    int *layer_stack_indices;
 
-    ~SparseBatch()
-    {
+    ~SparseBatch() {
         delete[] is_white;
         delete[] outcome;
         delete[] score;
@@ -392,81 +208,44 @@ struct SparseBatch
         delete[] layer_stack_indices;
     }
 
-private:
-
-    template <typename... Ts>
-    void fill_entry(FeatureSet<Ts...>, int i, const TrainingDataEntry& e)
-    {
+  private:
+    template <typename FeatureSetT>
+    void fill_entry(const FeatureSetT &fs, int i, const TrainingDataEntry &e) {
         is_white[i] = static_cast<float>(e.pos.sideToMove() == Color::White);
         outcome[i] = (e.result + 1.0f) / 2.0f;
         score[i] = e.score;
-        psqt_indices[i] = (e.pos.pieceCount() - 1) * 8 / MAX_PIECES;
+        psqt_indices[i] = (e.pos.pieceCount() - 1) * 8 / fs.config->PIECE_COUNT;
         layer_stack_indices[i] = psqt_indices[i];
-        fill_features(FeatureSet<Ts...>{}, i, e);
+        fill_features(fs, i, e);
     }
 
-    template <typename... Ts>
-    void fill_features(FeatureSet<Ts...>, int i, const TrainingDataEntry& e)
-    {
-        const int offset = i * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES;
+    template <typename FeatureSetT>
+    void fill_features(const FeatureSetT &fs, int i, const TrainingDataEntry &e) {
+        const int offset = i * fs.MAX_ACTIVE_FEATURES;
         num_active_white_features +=
-            FeatureSet<Ts...>::fill_features_sparse(e, white + offset, white_values + offset, Color::White)
-            .first;
+            fs.fill_features_sparse(e, white + offset, white_values + offset, Color::White).first;
         num_active_black_features +=
-            FeatureSet<Ts...>::fill_features_sparse(e, black + offset, black_values + offset, Color::Black)
-            .first;
+            fs.fill_features_sparse(e, black + offset, black_values + offset, Color::Black).first;
     }
 };
 
-struct AnyStream
-{
+struct AnyStream {
     virtual ~AnyStream() = default;
 };
 
-template <typename StorageT>
-struct Stream : AnyStream
-{
+template <typename StorageT> struct Stream : AnyStream {
     using StorageType = StorageT;
 
-    explicit Stream(std::unique_ptr<training_data::BasicSfenInputStream> stream) :
-        m_stream(std::move(stream)) {}
+    explicit Stream(std::unique_ptr<training_data::BasicSfenInputStream> stream)
+        : m_stream(std::move(stream)) {}
 
-    Stream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename, cyclic, skipPredicate))
-    {
-    }
+    virtual StorageT *next() = 0;
 
-    virtual StorageT* next() = 0;
-
-protected:
+  protected:
     std::unique_ptr<training_data::BasicSfenInputStream> m_stream;
 };
 
-template <typename StorageT>
-struct AsyncStream : Stream<StorageT>
-{
-    using BaseType = Stream<StorageT>;
-
-    AsyncStream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        BaseType(1, filename, cyclic, skipPredicate)
-    {
-    }
-
-    ~AsyncStream()
-    {
-        if (m_next.valid())
-        {
-            delete m_next.get();
-        }
-    }
-
-protected:
-    std::future<StorageT*> m_next;
-};
-
-template <typename FeatureSetT, typename StorageT>
-struct FeaturedBatchStream : Stream<StorageT>
-{
+template <typename FeatureSetT, typename StorageT> struct FeaturedBatchStream : Stream<StorageT> {
     static_assert(StorageT::IS_BATCH);
 
     using FeatureSet = FeatureSetT;
@@ -474,80 +253,86 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        BaseType(
-            std::max(
-                1,
-                concurrency / num_feature_threads_per_reading_thread
-            ),
-            filename,
-            cyclic,
-            skipPredicate
-        ),
-        m_concurrency(concurrency),
-        m_batch_size(batch_size)
-    {
+    FeaturedBatchStream(int concurrency, int batch_size,
+                        std::unique_ptr<training_data::BasicSfenInputStream> input, FeatureSet fs)
+        : BaseType(std::move(input)), m_features(std::move(fs)), m_batch_size(batch_size),
+          m_concurrency(concurrency) {
         m_stop_flag.store(false);
 
-        auto worker = [this]()
-        {
-            std::vector<TrainingDataEntry> entries;
-            entries.reserve(m_batch_size);
+        auto worker = [this]() {
+            try {
+                std::vector<TrainingDataEntry> entries;
+                entries.reserve(m_batch_size);
+                bin::BatchStorage storage(this->m_stream->config(), unsigned(m_batch_size));
+                while (!m_stop_flag.load()) {
+                    entries.clear();
 
-            while(!m_stop_flag.load())
-            {
-                entries.clear();
-
-                {
-                    std::unique_lock lock(m_stream_mutex);
-                    BaseType::m_stream->fill(entries, m_batch_size);
-                    if (entries.empty())
                     {
-                        break;
+                        std::unique_lock lock(m_stream_mutex);
+                        BaseType::m_stream->fill(entries, m_batch_size, &storage);
+                        if (entries.empty()) {
+                            break;
+                        }
+                    }
+
+                    auto batch = new StorageT(m_features, entries);
+
+                    {
+                        std::unique_lock lock(m_batch_mutex);
+                        m_batches_not_full.wait(lock, [this]() {
+                            return m_batches.size() < m_concurrency + 1 || m_stop_flag.load();
+                        });
+
+                        m_batches.emplace_back(batch);
+
+                        lock.unlock();
+                        m_batches_any.notify_one();
                     }
                 }
-
-                auto batch = new StorageT(FeatureSet{}, entries);
-
+            } catch (...) {
                 {
-                    std::unique_lock lock(m_batch_mutex);
-                    m_batches_not_full.wait(lock, [this]() { return m_batches.size() < m_concurrency + 1 || m_stop_flag.load(); });
-
-                    m_batches.emplace_back(batch);
-
-                    lock.unlock();
-                    m_batches_any.notify_one();
+                    std::lock_guard<std::mutex> lock(m_batch_mutex);
+                    m_error = std::current_exception();
+                    m_stop_flag.store(true);
                 }
-
+                m_batches_not_full.notify_all();
             }
             m_num_workers.fetch_sub(1);
             m_batches_any.notify_one();
         };
 
-        const int num_feature_threads = std::max(
-            1,
-            concurrency - std::max(1, concurrency / num_feature_threads_per_reading_thread)
-        );
+        const int num_feature_threads =
+            std::max(1, concurrency - std::max(1, concurrency / num_feature_threads_per_reading_thread));
 
-        for (int i = 0; i < num_feature_threads; ++i)
-        {
-            m_workers.emplace_back(worker);
+        try {
+            for (int i = 0; i < num_feature_threads; ++i) {
+                m_workers.emplace_back(worker);
 
-            // This cannot be done in the thread worker. We need
-            // to have a guarantee that this is incremented, but if
-            // we did it in the worker there's no guarantee
-            // that it executed.
-            m_num_workers.fetch_add(1);
+                // This cannot be done in the thread worker. We need
+                // to have a guarantee that this is incremented, but if
+                // we did it in the worker there's no guarantee
+                // that it executed.
+                m_num_workers.fetch_add(1);
+            }
+        } catch (...) {
+            m_stop_flag.store(true);
+            m_batches_not_full.notify_all();
+            for (auto &worker : m_workers)
+                worker.join();
+            for (auto *batch : m_batches)
+                delete batch;
+            throw;
         }
     }
 
-    StorageT* next() override
-    {
+    StorageT *next() override {
         std::unique_lock lock(m_batch_mutex);
-        m_batches_any.wait(lock, [this]() { return !m_batches.empty() || m_num_workers.load() == 0; });
+        m_batches_any.wait(lock,
+                           [this]() { return m_error || !m_batches.empty() || m_num_workers.load() == 0; });
 
-        if (!m_batches.empty())
-        {
+        if (m_error)
+            std::rethrow_exception(m_error);
+        if (!m_batches.empty()) {
             auto batch = m_batches.front();
             m_batches.pop_front();
 
@@ -559,29 +344,27 @@ struct FeaturedBatchStream : Stream<StorageT>
         return nullptr;
     }
 
-    ~FeaturedBatchStream()
-    {
+    ~FeaturedBatchStream() {
         m_stop_flag.store(true);
         m_batches_not_full.notify_all();
 
-        for (auto& worker : m_workers)
-        {
-            if (worker.joinable())
-            {
+        for (auto &worker : m_workers) {
+            if (worker.joinable()) {
                 worker.join();
             }
         }
 
-        for (auto& batch : m_batches)
-        {
+        for (auto &batch : m_batches) {
             delete batch;
         }
     }
 
-private:
+  private:
+    std::exception_ptr m_error;
+    FeatureSet m_features;
     int m_batch_size;
     int m_concurrency;
-    std::deque<StorageT*> m_batches;
+    std::deque<StorageT *> m_batches;
     std::mutex m_batch_mutex;
     std::mutex m_stream_mutex;
     std::condition_variable m_batches_not_full;
@@ -592,17 +375,14 @@ private:
     std::vector<std::thread> m_workers;
 };
 
-
 // PRP-only queue: keep the legacy sequential pipeline unchanged. Jobs receive
 // sequence numbers when read; features can finish in parallel, but consumption
 // remains ordered. Reserving a bounded number of jobs before reading also
 // guarantees that a slow first job can always publish without a full-queue deadlock.
-template <typename FeatureSetT, typename StorageT>
-struct PrpFeaturedBatchStream : Stream<StorageT>
-{
+template <typename FeatureSetT, typename StorageT> struct PrpFeaturedBatchStream : Stream<StorageT> {
     PrpFeaturedBatchStream(int concurrency, int batch_size,
-                          std::unique_ptr<training_data::BasicSfenInputStream> input)
-        : Stream<StorageT>(std::move(input)), m_batch_size(batch_size),
+                           std::unique_ptr<training_data::BasicSfenInputStream> input, FeatureSetT fs)
+        : Stream<StorageT>(std::move(input)), m_features(std::move(fs)), m_batch_size(batch_size),
           m_capacity(static_cast<std::size_t>(concurrency) + 1),
           m_active(std::max(1, concurrency - std::max(1, concurrency / 2))) {
         const int worker_count = m_active;
@@ -611,19 +391,20 @@ struct PrpFeaturedBatchStream : Stream<StorageT>
                 m_workers.emplace_back([this] { work(); });
         } catch (...) {
             stop();
-            for (auto& worker : m_workers) worker.join();
+            for (auto &worker : m_workers)
+                worker.join();
             throw;
         }
     }
 
-    StorageT* next() override {
+    StorageT *next() override {
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_changed.wait(lock, [this] {
-            return m_error || m_ready.count(m_output) || m_active == 0;
-        });
-        if (m_error) std::rethrow_exception(m_error);
+        m_changed.wait(lock, [this] { return m_error || m_ready.count(m_output) || m_active == 0; });
+        if (m_error)
+            std::rethrow_exception(m_error);
         auto found = m_ready.find(m_output);
-        if (found == m_ready.end()) return nullptr;
+        if (found == m_ready.end())
+            return nullptr;
         auto result = found->second.release();
         m_ready.erase(found);
         ++m_output;
@@ -635,12 +416,16 @@ struct PrpFeaturedBatchStream : Stream<StorageT>
 
     ~PrpFeaturedBatchStream() override {
         stop();
-        for (auto& worker : m_workers) worker.join();
+        for (auto &worker : m_workers)
+            worker.join();
     }
 
-private:
+  private:
     void stop() {
-        { std::lock_guard<std::mutex> lock(m_mutex); m_stop = true; }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
         m_changed.notify_all();
     }
 
@@ -648,6 +433,7 @@ private:
         try {
             std::vector<TrainingDataEntry> entries;
             entries.reserve(m_batch_size);
+            bin::BatchStorage storage(this->m_stream->config(), unsigned(m_batch_size));
             for (;;) {
                 entries.clear();
                 std::uint64_t id;
@@ -655,14 +441,14 @@ private:
                     std::unique_lock<std::mutex> read_lock(m_read_mutex);
                     {
                         std::unique_lock<std::mutex> lock(m_mutex);
-                        m_changed.wait(lock, [this] {
-                            return m_stop || m_eof || m_outstanding < m_capacity;
-                        });
-                        if (m_stop || m_eof) break;
+                        m_changed.wait(lock,
+                                       [this] { return m_stop || m_eof || m_outstanding < m_capacity; });
+                        if (m_stop || m_eof)
+                            break;
                         ++m_outstanding;
                         id = m_input++;
                     }
-                    this->m_stream->fill(entries, m_batch_size);
+                    this->m_stream->fill(entries, m_batch_size, &storage);
                     if (entries.empty()) {
                         std::lock_guard<std::mutex> lock(m_mutex);
                         --m_outstanding;
@@ -671,17 +457,19 @@ private:
                         break;
                     }
                 }
-                auto batch = std::make_unique<StorageT>(FeatureSetT{}, entries);
+                auto batch = std::make_unique<StorageT>(m_features, entries);
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
-                    if (m_stop) break;
+                    if (m_stop)
+                        break;
                     m_ready.emplace(id, std::move(batch));
                 }
                 m_changed.notify_all();
             }
         } catch (...) {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_error) m_error = std::current_exception();
+            if (!m_error)
+                m_error = std::current_exception();
             m_stop = true;
         }
         {
@@ -691,6 +479,7 @@ private:
         m_changed.notify_all();
     }
 
+    FeatureSetT m_features;
     int m_batch_size;
     std::size_t m_capacity, m_outstanding = 0;
     int m_active;
@@ -703,25 +492,17 @@ private:
     std::vector<std::thread> m_workers;
 };
 
-std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered, int random_fen_skipping)
-{
-    if (filtered || random_fen_skipping)
-    {
-        return [
-            random_fen_skipping,
-            prob = double(random_fen_skipping) / (random_fen_skipping + 1),
-            filtered
-            ](const TrainingDataEntry& e){
-
+std::function<bool(const TrainingDataEntry &)> make_skip_predicate(bool filtered, int random_fen_skipping) {
+    if (filtered || random_fen_skipping) {
+        return [random_fen_skipping, prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered](const TrainingDataEntry &e) {
             auto do_skip = [&]() {
                 std::bernoulli_distribution distrib(prob);
-                auto& prng = rng::get_thread_local_rng();
+                auto &prng = rng::get_thread_local_rng();
                 return distrib(prng);
             };
 
-            auto do_filter = [&]() {
-                return false;
-            };
+            auto do_filter = [&]() { return false; };
 
             static thread_local std::mt19937 gen(std::random_device{}());
             return (random_fen_skipping && do_skip()) || (filtered && do_filter());
@@ -733,171 +514,115 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered,
 
 // Unlike the legacy reader's thread-local RNG, PRP filtering belongs to the
 // traversal and is reproducible regardless of which feature worker reads next.
-std::function<bool(const TrainingDataEntry&)> make_prp_skip_predicate(
-    bool filtered, int random_fen_skipping, std::uint64_t seed, std::uint64_t epoch)
-{
+std::function<bool(const TrainingDataEntry &)>
+make_prp_skip_predicate(bool filtered, int random_fen_skipping, std::uint64_t seed, std::uint64_t epoch) {
     if (random_fen_skipping < 0)
         throw std::invalid_argument("random_fen_skipping must be nonnegative");
     auto filter = make_skip_predicate(filtered, 0);
-    if (!random_fen_skipping) return filter;
+    if (!random_fen_skipping)
+        return filter;
     return [filter, rng = std::mt19937_64(training_data::RecordPermutation::mix(seed ^ epoch)),
-            probability = double(random_fen_skipping) / (random_fen_skipping + 1.0)]
-           (const TrainingDataEntry& entry) mutable {
+            probability = double(random_fen_skipping) /
+                          (random_fen_skipping + 1.0)](const TrainingDataEntry &entry) mutable {
         return std::bernoulli_distribution(probability)(rng) || (filter && filter(entry));
     };
 }
 
 static thread_local std::string prp_last_error;
 
-template <typename FeatureSetT>
-Stream<SparseBatch>* make_prp_stream(int concurrency, const char* filename, int batch_size,
-                                    bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch)
-{
-    auto input = std::make_unique<training_data::PrpSfenInputStream>(
-        training_data::open_indexed_training_data_source(filename), seed, epoch,
-        make_prp_skip_predicate(filtered, skipping, seed, epoch));
-    return new PrpFeaturedBatchStream<FeatureSetT, SparseBatch>(concurrency, batch_size, std::move(input));
+using ConfigHandle = training_data::VariantPtr;
+using namespace training_data;
+template <Family F>
+Stream<SparseBatch> *make_stream(VariantPtr cfg, int concurrency, const char *filename, int batch_size,
+                                 bool cyclic, bool filtered, int skipping, std::uint64_t seed,
+                                 std::uint64_t epoch, unsigned bytes, bool shuffle) {
+    RuntimeFeatures<F> features(cfg);
+    if (std::uint64_t(batch_size) * features.MAX_ACTIVE_FEATURES > INT_MAX)
+        throw std::invalid_argument("Batch feature offsets exceed int32 capacity");
+    auto source = open_indexed_training_data_source(filename, bytes, cfg);
+    auto skip = (shuffle || bytes != 72) ? make_prp_skip_predicate(filtered, skipping, seed, epoch)
+                                         : make_skip_predicate(filtered, skipping);
+    std::unique_ptr<BasicSfenInputStream> input;
+    if (shuffle)
+        input = std::make_unique<PrpSfenInputStream>(std::move(source), seed, epoch, skip);
+    else
+        input = std::make_unique<IndexedSequentialInputStream>(std::move(source), cyclic, skip, bytes == 72);
+    if (shuffle || bytes != 72)
+        return new PrpFeaturedBatchStream<RuntimeFeatures<F>, SparseBatch>(
+            concurrency, batch_size, std::move(input), std::move(features));
+    return new FeaturedBatchStream<RuntimeFeatures<F>, SparseBatch>(concurrency, batch_size, std::move(input),
+                                                                    std::move(features));
 }
-
-template <typename FeatureSetT>
-Stream<SparseBatch>* make_sized_stream(int concurrency, const char* filename, int batch_size,
-    bool cyclic, bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch,
-    unsigned record_bytes, bool shuffle)
-{
-    auto source = training_data::open_indexed_training_data_source(filename, record_bytes);
-    auto skip = make_prp_skip_predicate(filtered, skipping, seed, epoch);
-    std::unique_ptr<training_data::BasicSfenInputStream> input;
-    if (shuffle) input = std::make_unique<training_data::PrpSfenInputStream>(std::move(source), seed, epoch, skip);
-    else input = std::make_unique<training_data::IndexedSequentialInputStream>(std::move(source), cyclic, skip);
-    return new PrpFeaturedBatchStream<FeatureSetT, SparseBatch>(concurrency, batch_size, std::move(input));
-}
-
 extern "C" {
-
-    // Additional entry points in the SAME library. The legacy ABI is unchanged.
-    EXPORT const char* CDECL get_prp_last_error() { return prp_last_error.c_str(); }
-
-    EXPORT std::uint64_t CDECL training_data_record_count_sized(const char* filename, unsigned record_bytes) {
-        prp_last_error.clear();
-        try { return training_data::open_indexed_training_data_source(filename, record_bytes)->record_count(); }
-        catch (const std::exception& e) { prp_last_error = e.what(); return 0; }
-    }
-
-    EXPORT Stream<SparseBatch>* CDECL create_sized_sparse_batch_stream(
-        const char* feature_set_c, int concurrency, const char* filename, int batch_size,
-        bool cyclic, bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch,
-        unsigned record_bytes, bool shuffle)
-    {
-        prp_last_error.clear();
-        try {
-            if ((shuffle && cyclic) || concurrency < 1 || batch_size < 1)
-                throw std::invalid_argument("Invalid sized-reader batch/workers/epoch settings");
-            std::string_view feature_set(feature_set_c);
-            if (feature_set == "HalfKP") return make_sized_stream<FeatureSet<HalfKP>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
-            if (feature_set == "HalfKP^") return make_sized_stream<FeatureSet<HalfKPFactorized>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
-            if (feature_set == "HalfKA") return make_sized_stream<FeatureSet<HalfKA>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
-            if (feature_set == "HalfKA^") return make_sized_stream<FeatureSet<HalfKAFactorized>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
-            if (feature_set == "HalfKAv2") return make_sized_stream<FeatureSet<HalfKAv2>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
-            if (feature_set == "HalfKAv2^") return make_sized_stream<FeatureSet<HalfKAv2Factorized>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
-            throw std::invalid_argument("Unknown feature_set: " + std::string(feature_set));
-        } catch (const std::exception& e) { prp_last_error = e.what(); return nullptr; }
-    }
-
-    EXPORT std::uint64_t CDECL training_data_record_count(const char* filename) {
-        prp_last_error.clear();
-        try {
-            return training_data::open_indexed_training_data_source(filename)->record_count();
-        } catch (const std::exception& e) { prp_last_error = e.what(); return 0; }
-    }
-
-    EXPORT Stream<SparseBatch>* CDECL create_prp_sparse_batch_stream(
-        const char* feature_set_c, int concurrency, const char* filename, int batch_size,
-        bool cyclic, bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch)
-    {
-        prp_last_error.clear();
-        try {
-            if (cyclic || concurrency < 1 || batch_size < 1)
-                throw std::invalid_argument("PRP requires a finite epoch, positive workers and positive batch size");
-            std::string_view feature_set(feature_set_c);
-            if (feature_set == "HalfKP") return make_prp_stream<FeatureSet<HalfKP>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
-            if (feature_set == "HalfKP^") return make_prp_stream<FeatureSet<HalfKPFactorized>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
-            if (feature_set == "HalfKA") return make_prp_stream<FeatureSet<HalfKA>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
-            if (feature_set == "HalfKA^") return make_prp_stream<FeatureSet<HalfKAFactorized>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
-            if (feature_set == "HalfKAv2") return make_prp_stream<FeatureSet<HalfKAv2>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
-            if (feature_set == "HalfKAv2^") return make_prp_stream<FeatureSet<HalfKAv2Factorized>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
-            throw std::invalid_argument("Unknown feature_set: " + std::string(feature_set));
-        } catch (const std::exception& e) { prp_last_error = e.what(); return nullptr; }
-    }
-
-    EXPORT SparseBatch* CDECL fetch_next_prp_sparse_batch(Stream<SparseBatch>* stream) {
-        prp_last_error.clear();
-        try { return stream->next(); }
-        catch (const std::exception& e) { prp_last_error = e.what(); return nullptr; }
-    }
-
-    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping)
-    {
-        auto skipPredicate = make_skip_predicate(filtered, random_fen_skipping);
-
-        std::string_view feature_set(feature_set_c);
-        if (feature_set == "HalfKP")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKP^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKA")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKA^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKAv2")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKAv2^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
-        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+EXPORT unsigned CDECL get_loader_abi_version() { return 1; }
+EXPORT const char *CDECL get_prp_last_error() { return prp_last_error.c_str(); }
+EXPORT ConfigHandle *CDECL create_variant_context(unsigned files, unsigned ranks, unsigned types,
+                                                  unsigned pieces, unsigned kings, unsigned pockets) {
+    prp_last_error.clear();
+    try {
+        return new ConfigHandle(
+            std::make_shared<const VariantConfig>(files, ranks, types, pieces, kings, pockets));
+    } catch (const std::exception &e) {
+        prp_last_error = e.what();
         return nullptr;
     }
-
-    EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
-    {
-        delete stream;
+}
+EXPORT void CDECL destroy_variant_context(ConfigHandle *h) { delete h; }
+EXPORT std::uint64_t CDECL generic_record_count(ConfigHandle *h, const char *filename, unsigned bytes) {
+    prp_last_error.clear();
+    try {
+        if (!h || !filename)
+            throw std::invalid_argument("Missing variant context or filename");
+        return open_indexed_training_data_source(filename, bytes, *h)->record_count();
+    } catch (const std::exception &e) {
+        prp_last_error = e.what();
+        return 0;
     }
-
-    EXPORT SparseBatch* CDECL fetch_next_sparse_batch(Stream<SparseBatch>* stream)
-    {
+}
+EXPORT Stream<SparseBatch> *CDECL create_generic_batch_stream(
+    ConfigHandle *h, const char *feature, int concurrency, const char *filename, int batch_size, bool cyclic,
+    bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch, unsigned bytes, bool shuffle) {
+    prp_last_error.clear();
+    try {
+        if (!h || !feature || !filename || concurrency < 1 || batch_size < 1 || skipping < 0 ||
+            (shuffle && cyclic))
+            throw std::invalid_argument("Invalid generic reader settings");
+        std::string_view name(feature);
+        if (name == "HalfKP")
+            return make_stream<Family::KP>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
+                                           seed, epoch, bytes, shuffle);
+        if (name == "HalfKP^")
+            return make_stream<Family::KPF>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
+                                            seed, epoch, bytes, shuffle);
+        if (name == "HalfKA")
+            return make_stream<Family::KA>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
+                                           seed, epoch, bytes, shuffle);
+        if (name == "HalfKA^")
+            return make_stream<Family::KAF>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
+                                            seed, epoch, bytes, shuffle);
+        if (name == "HalfKAv2")
+            return make_stream<Family::V2>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
+                                           seed, epoch, bytes, shuffle);
+        if (name == "HalfKAv2^")
+            return make_stream<Family::V2F>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
+                                            seed, epoch, bytes, shuffle);
+        throw std::invalid_argument("Unknown feature_set: " + std::string(name));
+    } catch (const std::exception &e) {
+        prp_last_error = e.what();
+        return nullptr;
+    }
+}
+EXPORT SparseBatch *CDECL fetch_next_generic_batch(Stream<SparseBatch> *stream) {
+    prp_last_error.clear();
+    try {
+        if (!stream)
+            throw std::invalid_argument("Missing batch stream");
         return stream->next();
+    } catch (const std::exception &e) {
+        prp_last_error = e.what();
+        return nullptr;
     }
-
-    EXPORT void CDECL destroy_sparse_batch(SparseBatch* e)
-    {
-        delete e;
-    }
-
 }
-
-/* benches */ //*
-#include <chrono>
-
-int main()
-{
-    auto stream = create_sparse_batch_stream("HalfKP", 4, "10m_d3_q_2.bin", 8192, true, false, 0);
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 1000; ++i)
-    {
-        if (i % 100 == 0) std::cout << i << '\n';
-        destroy_sparse_batch(stream->next());
-    }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    std::cout << (t1 - t0).count() / 1e9 << "s\n";
+EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch> *stream) { delete stream; }
+EXPORT void CDECL destroy_sparse_batch(SparseBatch *batch) { delete batch; }
 }
-//*/

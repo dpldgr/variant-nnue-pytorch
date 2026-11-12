@@ -85,7 +85,7 @@ def main():
 
     batch_size = 1000
 
-    feature_set = features.get_feature_set_from_name(args.features)
+    feature_set = features.get_feature_set_from_name(args.features, features.config_from_args(args))
     if args.checkpoint:
         model = NNUE.load_from_checkpoint(args.checkpoint, feature_set=feature_set)
     else:

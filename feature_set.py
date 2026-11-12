@@ -27,12 +27,17 @@ class FeatureSet:
             if not isinstance(feature, FeatureBlock):
                 raise Exception('All features must subclass FeatureBlock')
 
+        self.config = features[0].layout.config
+        if any(not f.layout.config.compatible_with(self.config) for f in features):
+            raise ValueError("Feature blocks use different variant configurations")
         self.features = features
         self.hash = _calculate_features_hash(features)
         self.name = '+'.join(feature.name for feature in features)
         self.num_real_features = sum(feature.num_real_features for feature in features)
         self.num_virtual_features = sum(feature.num_virtual_features for feature in features)
         self.num_features = sum(feature.num_features for feature in features)
+        if self.num_features > 2147483647:
+            raise ValueError("Variant feature dimensions exceed int32 feature IDs")
         self.num_psqt_buckets = PSQT_BUCKETS
         self.num_ls_buckets = LS_BUCKETS
 

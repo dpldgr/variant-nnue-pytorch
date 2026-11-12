@@ -32,10 +32,11 @@ class PrpLoaderState(pl.Callback):
 
 def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size, data_loader='sequential', seed=42, record_bytes=72):
   features_name = feature_set.name
+  config = getattr(feature_set, "config", None)
   if data_loader == 'prp':
     dataset = nnue_dataset.PrpBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
                                           filtered=filtered, random_fen_skipping=random_fen_skipping,
-                                          device=main_device, seed=seed, record_bytes=record_bytes)
+                                          device=main_device, seed=seed, record_bytes=record_bytes, config=config)
     if epoch_size is not None and epoch_size != dataset.record_count:
       raise ValueError('--epoch-size must match the dataset record count ({}) with --data-loader prp.'.format(dataset.record_count))
     train = DataLoader(dataset, batch_size=None, batch_sampler=None)
@@ -43,12 +44,12 @@ def make_data_loaders(train_filename, val_filename, feature_set, num_workers, ba
   elif data_loader == 'sequential':
     epoch_size = 20000000 if epoch_size is None else epoch_size
     train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, record_bytes=record_bytes)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, record_bytes=record_bytes, config=config)
     train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
   else:
     raise ValueError('Unknown data loader: ' + data_loader)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device, record_bytes=record_bytes)
+                                                   random_fen_skipping=random_fen_skipping, device=main_device, record_bytes=record_bytes, config=config)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   val = DataLoader(nnue_dataset.FixedNumBatchesDataset(val_infinite, (val_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -87,7 +88,7 @@ def main():
   if not os.path.exists(args.val):
     raise Exception('{0} does not exist'.format(args.val))
 
-  feature_set = features.get_feature_set_from_name(args.features)
+  feature_set = features.get_feature_set_from_name(args.features, features.config_from_args(args))
 
   if args.resume_from_model is None:
     nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_)

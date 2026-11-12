@@ -211,7 +211,7 @@ def main():
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
-  feature_set = features.get_feature_set_from_name(args.features)
+  feature_set = features.get_feature_set_from_name(args.features, features.config_from_args(args))
 
   print('Converting %s to %s' % (args.source, args.target))
 
@@ -221,7 +221,8 @@ def main():
   elif args.source.endswith('.pt'):
     # Load with weights_only=False to avoid safe_globals complexity
     # This is safe since we trust the checkpoint source
-    nnue = torch.load(args.source, weights_only=False)
+    nnue = torch.load(args.source, map_location='cpu', weights_only=False)
+    nnue.set_feature_set(features.get_feature_set_from_name(nnue.feature_set.name, feature_set.config))
   elif args.source.endswith('.nnue'):
     with open(args.source, 'rb') as f:
       reader = NNUEReader(f, feature_set)

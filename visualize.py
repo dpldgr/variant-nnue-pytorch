@@ -516,7 +516,7 @@ def main():
 
     supported_features = ('HalfKAv2', 'HalfKAv2^')
     assert args.features in supported_features
-    feature_set = features.get_feature_set_from_name(args.features)
+    feature_set = features.get_feature_set_from_name(args.features, features.config_from_args(args))
 
     from os.path import basename
     label = basename(args.model)

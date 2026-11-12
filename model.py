@@ -153,8 +153,16 @@ class NNUE(pl.LightningModule):
 
   def on_save_checkpoint(self, checkpoint):
     checkpoint['score_target'] = self.score_target.config()
+    config = getattr(self.feature_set, 'config', None)
+    if config is not None:
+      checkpoint['variant_config'] = config.to_dict()
 
   def on_load_checkpoint(self, checkpoint):
+    config = getattr(self.feature_set, 'config', None)
+    if config is not None and 'variant_config' in checkpoint:
+      import variant
+      if not config.compatible_with(variant.VariantConfig.from_dict(checkpoint['variant_config'])):
+        raise ValueError('Variant configuration does not match saved checkpoint')
     hparams = checkpoint.get('hyper_parameters', {})
     config = checkpoint.get('score_target', dict(
         version=score_targets.VERSION, name=hparams.get('score_target', 'sigmoid'),
@@ -243,7 +251,14 @@ class NNUE(pl.LightningModule):
   to new_feature_set.
   '''
   def set_feature_set(self, new_feature_set):
+    current = getattr(self.feature_set, 'config', None)
+    replacement = getattr(new_feature_set, 'config', None)
+    if current is not None and replacement is not None and not current.compatible_with(replacement):
+      raise ValueError('Variant configuration does not match saved model')
     if self.feature_set.name == new_feature_set.name:
+      if self.input.weight.shape[0] != new_feature_set.num_features:
+        raise ValueError('Variant feature dimensions do not match saved model')
+      self.feature_set = new_feature_set
       return
 
     # TODO: Implement this for more complicated conversions.

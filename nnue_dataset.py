@@ -6,12 +6,27 @@ import sys
 import glob
 from torch.utils.data import Dataset
 
-local_dllpath = [n for n in glob.glob('./*training_data_loader.*') if n.endswith('.so') or n.endswith('.dll') or n.endswith('.dylib')]
-if not local_dllpath:
-    print('Cannot find data_loader shared library.')
-    sys.exit(1)
-dllpath = os.path.abspath(local_dllpath[0])
-dll = ctypes.cdll.LoadLibrary(dllpath)
+from pathlib import Path
+import variant
+
+# Resolve next to this module, never an unrelated DLL in the current directory.
+_root = Path(__file__).resolve().parent
+_names = (('training_data_loader.dll', 'libtraining_data_loader.dll') if sys.platform == 'win32'
+          else ('libtraining_data_loader.dylib',) if sys.platform == 'darwin'
+          else ('libtraining_data_loader.so',))
+_candidates = [_root / name for name in _names]
+_dllpath = next((path for path in _candidates if path.is_file()), None)
+if _dllpath is None:
+    raise RuntimeError('Generic data-loader library is missing. Install the matching prebuilt library or build it once.')
+dll = ctypes.cdll.LoadLibrary(str(_dllpath))
+try:
+    _version = dll.get_loader_abi_version
+except AttributeError as exc:
+    raise RuntimeError('This is a variant-specific DLL; install the generic data-loader library.') from exc
+_version.restype = ctypes.c_uint
+_version.argtypes = []
+if _version() != 1:
+    raise RuntimeError('Incompatible generic data-loader ABI version')
 
 class SparseBatch(ctypes.Structure):
     _fields_ = [
@@ -117,70 +132,107 @@ class TrainingDataProvider:
             self.destroy_stream(self.stream)
             self.stream = None
 
-create_sparse_batch_stream = dll.create_sparse_batch_stream
-create_sparse_batch_stream.restype = ctypes.c_void_p
-create_sparse_batch_stream.argtypes = [
-    ctypes.c_char_p,  # feature_set
-    ctypes.c_int,     # num_workers
-    ctypes.c_char_p,  # filename
-    ctypes.c_int,     # batch_size
-    ctypes.c_bool,    # cyclic
-    ctypes.c_bool,    # filtered
-    ctypes.c_int      # random_fen_skipping
-]
-destroy_sparse_batch_stream = dll.destroy_sparse_batch_stream
-destroy_sparse_batch_stream.argtypes = [ctypes.c_void_p]
+def _bind(name, result, args):
+    function = getattr(dll, name)
+    function.restype, function.argtypes = result, args
+    return function
 
-fetch_next_sparse_batch = dll.fetch_next_sparse_batch
-fetch_next_sparse_batch.restype = SparseBatchPtr
-fetch_next_sparse_batch.argtypes = [ctypes.c_void_p]
-destroy_sparse_batch = dll.destroy_sparse_batch
+_error = _bind('get_prp_last_error', ctypes.c_char_p, [])
+_create_context = _bind('create_variant_context', ctypes.c_void_p, [ctypes.c_uint] * 6)
+_destroy_context = _bind('destroy_variant_context', None, [ctypes.c_void_p])
+_count = _bind('generic_record_count', ctypes.c_uint64, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint])
+_create = _bind('create_generic_batch_stream', ctypes.c_void_p,
+    [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+     ctypes.c_bool, ctypes.c_bool, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64,
+     ctypes.c_uint, ctypes.c_bool])
+_fetch = _bind('fetch_next_generic_batch', SparseBatchPtr, [ctypes.c_void_p])
+_destroy_stream = _bind('destroy_sparse_batch_stream', None, [ctypes.c_void_p])
+_destroy_batch = _bind('destroy_sparse_batch', None, [SparseBatchPtr])
 
 
-class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', record_bytes=72):
-        self.record_bytes = validate_record_bytes(record_bytes)
-        if record_bytes != 72:
-            create, fetch, _, self.error = _sized_api()
-            super().__init__(feature_set, create, destroy_sparse_batch_stream, fetch,
-                             destroy_sparse_batch, filename, cyclic, num_workers,
-                             batch_size, filtered, random_fen_skipping, device,
-                             stream_args=(42, 0, record_bytes, False))
-            if not self.stream:
-                raise RuntimeError(self.error().decode('utf-8', errors='replace'))
-            return
-        super(SparseBatchProvider, self).__init__(
-            feature_set,
-            create_sparse_batch_stream,
-            destroy_sparse_batch_stream,
-            fetch_next_sparse_batch,
-            destroy_sparse_batch,
-            filename,
-            cyclic,
-            num_workers,
-            batch_size,
-            filtered,
-            random_fen_skipping,
-            device)
+class NativeVariant:
+    def __init__(self, config):
+        self.handle = _create_context(config.FILES, config.RANKS, config.PIECE_TYPES,
+                                      config.PIECE_COUNT, config.KING_SQUARES, config.USE_POCKETS)
+        if not self.handle:
+            raise RuntimeError(_error().decode('utf-8', errors='replace'))
+
+    def close(self):
+        if getattr(self, 'handle', None):
+            _destroy_context(self.handle)
+            self.handle = None
+
+    def __del__(self):
+        self.close()
+
+
+def validate_record_bytes(value):
+    if type(value) is not int or not 7 <= value <= 144:
+        raise ValueError('record bytes must be an integer in 7..144')
+    return value
+
+
+def _checked_next(provider):
+    batch = provider.fetch_next(provider.stream)
+    if not batch:
+        error = provider.error()
+        if error:
+            raise RuntimeError(error.decode('utf-8', errors='replace'))
+        raise StopIteration
+    try:
+        if batch.contents.num_inputs != provider.expected_inputs:
+            raise RuntimeError('Native/Python feature dimensions disagree')
+        return batch.contents.get_tensors(provider.device)
+    finally:
+        provider.destroy_part(batch)
+
+
+class GenericBatchProvider(TrainingDataProvider):
+    def __init__(self, feature_set, filename, batch_size, cyclic, num_workers, filtered,
+                 random_fen_skipping, device, record_bytes, config, seed=42, epoch=0, shuffle=False):
+        validate_record_bytes(record_bytes)
+        self.config = config or variant.default_config()
+        self.native = NativeVariant(self.config)
+        self.device, self.error = device, _error
+        self.fetch_next, self.destroy_part, self.destroy_stream = _fetch, _destroy_batch, _destroy_stream
+        self.stream = _create(self.native.handle, feature_set.encode('utf-8'), num_workers,
+                              os.fsencode(filename), batch_size, cyclic, filtered, random_fen_skipping,
+                              seed % (1 << 64), epoch, record_bytes, shuffle)
+        if not self.stream:
+            message = _error().decode('utf-8', errors='replace')
+            self.native.close()
+            raise RuntimeError(message)
+        import features
+        self.expected_inputs = features.get_feature_set_from_name(feature_set, self.config).num_features
 
     def __next__(self):
-        return super().__next__() if self.record_bytes == 72 else _checked_next(self)
+        return _checked_next(self)
+
+    def close(self):
+        super().close()
+        if hasattr(self, 'native'):
+            self.native.close()
+
+
+class SparseBatchProvider(GenericBatchProvider):
+    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1,
+                 filtered=False, random_fen_skipping=0, device='cpu', record_bytes=72, config=None):
+        super().__init__(feature_set, filename, batch_size, cyclic, num_workers, filtered,
+                         random_fen_skipping, device, record_bytes, config)
+
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', record_bytes=72):
-    super(SparseBatchDataset).__init__()
-    self.feature_set = feature_set
-    self.filename = filename
-    self.batch_size = batch_size
-    self.cyclic = cyclic
-    self.num_workers = num_workers
-    self.filtered = filtered
-    self.random_fen_skipping = random_fen_skipping
-    self.device = device
-    self.record_bytes = validate_record_bytes(record_bytes)
+    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1,
+                 filtered=False, random_fen_skipping=0, device='cpu', record_bytes=72, config=None):
+        super().__init__()
+        self.config = config or variant.default_config()
+        self.args = dict(feature_set=feature_set, filename=filename, batch_size=batch_size,
+                         cyclic=cyclic, num_workers=num_workers, filtered=filtered,
+                         random_fen_skipping=random_fen_skipping, device=device,
+                         record_bytes=validate_record_bytes(record_bytes), config=self.config)
 
-  def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, record_bytes=self.record_bytes)
+    def __iter__(self):
+        return SparseBatchProvider(**self.args)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):
@@ -196,84 +248,23 @@ class FixedNumBatchesDataset(Dataset):
     return next(self.iter)
 
 
-def _prp_api():
-    # Resolve only for PRP, so sequential mode still works with an older DLL.
-    try:
-        create = dll.create_prp_sparse_batch_stream
-        fetch = dll.fetch_next_prp_sparse_batch
-        count = dll.training_data_record_count
-        error = dll.get_prp_last_error
-    except AttributeError as exc:
-        raise RuntimeError('Rebuild the existing data-loader library to enable PRP loading.') from exc
-    create.restype = ctypes.c_void_p
-    create.argtypes = create_sparse_batch_stream.argtypes + [ctypes.c_uint64, ctypes.c_uint64]
-    fetch.restype = SparseBatchPtr
-    fetch.argtypes = [ctypes.c_void_p]
-    count.restype = ctypes.c_uint64
-    count.argtypes = [ctypes.c_char_p]
-    error.restype = ctypes.c_char_p
-    error.argtypes = []
-    return create, fetch, count, error
-
-
-def validate_record_bytes(value):
-    if not isinstance(value, int) or not 7 <= value <= 144:
-        raise ValueError('record bytes must be an integer in 7..144')
-    return value
-
-
-def _sized_api():
-    try:
-        create = dll.create_sized_sparse_batch_stream
-        count = dll.training_data_record_count_sized
-    except AttributeError as exc:
-        raise RuntimeError('Rebuild the data-loader library for --record-bytes support.') from exc
-    _, fetch, _, error = _prp_api()
-    create.restype = ctypes.c_void_p
-    create.argtypes = create_sparse_batch_stream.argtypes + [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint, ctypes.c_bool]
-    count.restype = ctypes.c_uint64
-    count.argtypes = [ctypes.c_char_p, ctypes.c_uint]
-    return create, fetch, count, error
-
-
-def _checked_next(provider):
-    batch = provider.fetch_next(provider.stream)
-    if not batch:
-        error = provider.error()
-        if error:
-            raise RuntimeError(error.decode('utf-8', errors='replace'))
-        raise StopIteration
-    try:
-        return batch.contents.get_tensors(provider.device)
-    finally:
-        provider.destroy_part(batch)
-
-
-def training_data_record_count(filename, record_bytes=72):
+def training_data_record_count(filename, record_bytes=72, config=None):
     validate_record_bytes(record_bytes)
-    _, _, count, error = _prp_api() if record_bytes == 72 else _sized_api()
-    args = () if record_bytes == 72 else (record_bytes,)
-    result = count(os.fsencode(filename), *args)
-    if not result:
-        raise RuntimeError(error().decode('utf-8', errors='replace'))
-    return result
+    native = NativeVariant(config or variant.default_config())
+    try:
+        result = _count(native.handle, os.fsencode(filename), record_bytes)
+        if not result:
+            raise RuntimeError(_error().decode('utf-8', errors='replace'))
+        return result
+    finally:
+        native.close()
 
 
-class PrpSparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename, batch_size, num_workers=1,
-                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, epoch=0, record_bytes=72):
-        validate_record_bytes(record_bytes)
-        create, fetch, _, self.error = _prp_api() if record_bytes == 72 else _sized_api()
-        args = (seed, epoch) if record_bytes == 72 else (seed, epoch, record_bytes, True)
-        super().__init__(feature_set, create, destroy_sparse_batch_stream, fetch,
-                         destroy_sparse_batch, filename, False, num_workers,
-                         batch_size, filtered, random_fen_skipping, device,
-                         stream_args=args)
-        if not self.stream:
-            raise RuntimeError(self.error().decode('utf-8', errors='replace'))
-
-    def __next__(self):
-        return _checked_next(self)
+class PrpSparseBatchProvider(GenericBatchProvider):
+    def __init__(self, feature_set, filename, batch_size, num_workers=1, filtered=False,
+                 random_fen_skipping=0, device='cpu', seed=42, epoch=0, record_bytes=72, config=None):
+        super().__init__(feature_set, filename, batch_size, False, num_workers, filtered,
+                         random_fen_skipping, device, record_bytes, config, seed, epoch, True)
 
 
 class PrpBatchDataset(torch.utils.data.IterableDataset):
@@ -283,7 +274,7 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
     batches. Record counting and reads are delegated to the storage backend.
     """
     def __init__(self, feature_set, filename, batch_size, num_workers=1,
-                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, record_bytes=72):
+                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, record_bytes=72, config=None):
         super().__init__()
         if batch_size < 1 or num_workers < 1 or random_fen_skipping < 0:
             raise ValueError('PRP requires positive batch size/workers and nonnegative skipping.')
@@ -296,7 +287,8 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         self.device = device
         self.seed = seed % (1 << 64)
         self.record_bytes = validate_record_bytes(record_bytes)
-        self.record_count = training_data_record_count(filename, record_bytes)
+        self.config = config or variant.default_config()
+        self.record_count = training_data_record_count(filename, record_bytes, self.config)
         self.next_epoch = 0
         self.epoch_complete = True
 
@@ -310,7 +302,7 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         self.epoch_complete = False
         provider = PrpSparseBatchProvider(
             self.feature_set, self.filename, self.batch_size, self.num_workers,
-            self.filtered, self.random_fen_skipping, self.device, self.seed, epoch, self.record_bytes)
+            self.filtered, self.random_fen_skipping, self.device, self.seed, epoch, self.record_bytes, self.config)
         try:
             yield from provider
             self.epoch_complete = True
@@ -321,16 +313,18 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         return dict(version=1, next_epoch=self.next_epoch, epoch_complete=self.epoch_complete, seed=self.seed,
                     record_count=self.record_count, batch_size=self.batch_size,
                     feature_set=self.feature_set, filtered=self.filtered,
-                    random_fen_skipping=self.random_fen_skipping, record_bytes=self.record_bytes)
+                    random_fen_skipping=self.random_fen_skipping, record_bytes=self.record_bytes, variant_config=self.config.to_dict())
 
     def load_state_dict(self, state):
         if not state.get('epoch_complete', False):
             raise ValueError('PRP resumption currently requires a completed-epoch checkpoint.')
+        if 'variant_config' in state and not self.config.compatible_with(variant.VariantConfig.from_dict(state['variant_config'])):
+            raise ValueError('PRP checkpoint does not match current variant configuration')
         expected = self.state_dict()
         for key in expected:
             # A lossless conversion can change record width without changing
             # logical positions or permutation state. Legacy states omit it.
-            if key not in ('next_epoch', 'epoch_complete', 'record_bytes') and state.get(key) != expected[key]:
+            if key not in ('next_epoch', 'epoch_complete', 'record_bytes', 'variant_config') and state.get(key) != expected[key]:
                 raise ValueError('PRP checkpoint does not match current loader setting: ' + key)
         self.next_epoch = int(state['next_epoch'])
         if self.next_epoch < 0:
