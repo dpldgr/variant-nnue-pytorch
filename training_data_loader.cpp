@@ -8,10 +8,15 @@
 #include <thread>
 #include <deque>
 #include <random>
+#include <map>
+#include <exception>
+#include <condition_variable>
+#include <atomic>
 
 #include "lib/nnue_training_data_formats.h"
 #include "lib/nnue_training_data_stream.h"
 #include "lib/rng.h"
+#include "lib/prp_training_data_stream.h"
 
 #if defined (__x86_64__)
 #define EXPORT
@@ -423,6 +428,9 @@ struct Stream : AnyStream
 {
     using StorageType = StorageT;
 
+    explicit Stream(std::unique_ptr<training_data::BasicSfenInputStream> stream) :
+        m_stream(std::move(stream)) {}
+
     Stream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
         m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename, cyclic, skipPredicate))
     {
@@ -579,11 +587,121 @@ private:
     std::condition_variable m_batches_not_full;
     std::condition_variable m_batches_any;
     std::atomic_bool m_stop_flag;
-    std::atomic_int m_num_workers;
+    std::atomic_int m_num_workers{0};
 
     std::vector<std::thread> m_workers;
 };
 
+
+// PRP-only queue: keep the legacy sequential pipeline unchanged. Jobs receive
+// sequence numbers when read; features can finish in parallel, but consumption
+// remains ordered. Reserving a bounded number of jobs before reading also
+// guarantees that a slow first job can always publish without a full-queue deadlock.
+template <typename FeatureSetT, typename StorageT>
+struct PrpFeaturedBatchStream : Stream<StorageT>
+{
+    PrpFeaturedBatchStream(int concurrency, int batch_size,
+                          std::unique_ptr<training_data::BasicSfenInputStream> input)
+        : Stream<StorageT>(std::move(input)), m_batch_size(batch_size),
+          m_capacity(static_cast<std::size_t>(concurrency) + 1),
+          m_active(std::max(1, concurrency - std::max(1, concurrency / 2))) {
+        const int worker_count = m_active;
+        try {
+            for (int i = 0; i < worker_count; ++i)
+                m_workers.emplace_back([this] { work(); });
+        } catch (...) {
+            stop();
+            for (auto& worker : m_workers) worker.join();
+            throw;
+        }
+    }
+
+    StorageT* next() override {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_changed.wait(lock, [this] {
+            return m_error || m_ready.count(m_output) || m_active == 0;
+        });
+        if (m_error) std::rethrow_exception(m_error);
+        auto found = m_ready.find(m_output);
+        if (found == m_ready.end()) return nullptr;
+        auto result = found->second.release();
+        m_ready.erase(found);
+        ++m_output;
+        --m_outstanding;
+        lock.unlock();
+        m_changed.notify_all();
+        return result;
+    }
+
+    ~PrpFeaturedBatchStream() override {
+        stop();
+        for (auto& worker : m_workers) worker.join();
+    }
+
+private:
+    void stop() {
+        { std::lock_guard<std::mutex> lock(m_mutex); m_stop = true; }
+        m_changed.notify_all();
+    }
+
+    void work() {
+        try {
+            std::vector<TrainingDataEntry> entries;
+            entries.reserve(m_batch_size);
+            for (;;) {
+                entries.clear();
+                std::uint64_t id;
+                {
+                    std::unique_lock<std::mutex> read_lock(m_read_mutex);
+                    {
+                        std::unique_lock<std::mutex> lock(m_mutex);
+                        m_changed.wait(lock, [this] {
+                            return m_stop || m_eof || m_outstanding < m_capacity;
+                        });
+                        if (m_stop || m_eof) break;
+                        ++m_outstanding;
+                        id = m_input++;
+                    }
+                    this->m_stream->fill(entries, m_batch_size);
+                    if (entries.empty()) {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        --m_outstanding;
+                        m_eof = true;
+                        m_changed.notify_all();
+                        break;
+                    }
+                }
+                auto batch = std::make_unique<StorageT>(FeatureSetT{}, entries);
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_stop) break;
+                    m_ready.emplace(id, std::move(batch));
+                }
+                m_changed.notify_all();
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_error) m_error = std::current_exception();
+            m_stop = true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            --m_active;
+        }
+        m_changed.notify_all();
+    }
+
+    int m_batch_size;
+    std::size_t m_capacity, m_outstanding = 0;
+    int m_active;
+    bool m_stop = false, m_eof = false;
+    std::uint64_t m_input = 0, m_output = 0;
+    std::exception_ptr m_error;
+    std::mutex m_mutex, m_read_mutex;
+    std::condition_variable m_changed;
+    std::map<std::uint64_t, std::unique_ptr<StorageT>> m_ready;
+    std::vector<std::thread> m_workers;
+};
 
 std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered, int random_fen_skipping)
 {
@@ -613,7 +731,70 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered,
     return nullptr;
 }
 
+// Unlike the legacy reader's thread-local RNG, PRP filtering belongs to the
+// traversal and is reproducible regardless of which feature worker reads next.
+std::function<bool(const TrainingDataEntry&)> make_prp_skip_predicate(
+    bool filtered, int random_fen_skipping, std::uint64_t seed, std::uint64_t epoch)
+{
+    if (random_fen_skipping < 0)
+        throw std::invalid_argument("random_fen_skipping must be nonnegative");
+    auto filter = make_skip_predicate(filtered, 0);
+    if (!random_fen_skipping) return filter;
+    return [filter, rng = std::mt19937_64(training_data::RecordPermutation::mix(seed ^ epoch)),
+            probability = double(random_fen_skipping) / (random_fen_skipping + 1.0)]
+           (const TrainingDataEntry& entry) mutable {
+        return std::bernoulli_distribution(probability)(rng) || (filter && filter(entry));
+    };
+}
+
+static thread_local std::string prp_last_error;
+
+template <typename FeatureSetT>
+Stream<SparseBatch>* make_prp_stream(int concurrency, const char* filename, int batch_size,
+                                    bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch)
+{
+    auto input = std::make_unique<training_data::PrpSfenInputStream>(
+        training_data::open_indexed_training_data_source(filename), seed, epoch,
+        make_prp_skip_predicate(filtered, skipping, seed, epoch));
+    return new PrpFeaturedBatchStream<FeatureSetT, SparseBatch>(concurrency, batch_size, std::move(input));
+}
+
 extern "C" {
+
+    // Additional entry points in the SAME library. The legacy ABI is unchanged.
+    EXPORT const char* CDECL get_prp_last_error() { return prp_last_error.c_str(); }
+
+    EXPORT std::uint64_t CDECL training_data_record_count(const char* filename) {
+        prp_last_error.clear();
+        try {
+            return training_data::open_indexed_training_data_source(filename)->record_count();
+        } catch (const std::exception& e) { prp_last_error = e.what(); return 0; }
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL create_prp_sparse_batch_stream(
+        const char* feature_set_c, int concurrency, const char* filename, int batch_size,
+        bool cyclic, bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch)
+    {
+        prp_last_error.clear();
+        try {
+            if (cyclic || concurrency < 1 || batch_size < 1)
+                throw std::invalid_argument("PRP requires a finite epoch, positive workers and positive batch size");
+            std::string_view feature_set(feature_set_c);
+            if (feature_set == "HalfKP") return make_prp_stream<FeatureSet<HalfKP>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
+            if (feature_set == "HalfKP^") return make_prp_stream<FeatureSet<HalfKPFactorized>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
+            if (feature_set == "HalfKA") return make_prp_stream<FeatureSet<HalfKA>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
+            if (feature_set == "HalfKA^") return make_prp_stream<FeatureSet<HalfKAFactorized>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
+            if (feature_set == "HalfKAv2") return make_prp_stream<FeatureSet<HalfKAv2>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
+            if (feature_set == "HalfKAv2^") return make_prp_stream<FeatureSet<HalfKAv2Factorized>>(concurrency, filename, batch_size, filtered, skipping, seed, epoch);
+            throw std::invalid_argument("Unknown feature_set: " + std::string(feature_set));
+        } catch (const std::exception& e) { prp_last_error = e.what(); return nullptr; }
+    }
+
+    EXPORT SparseBatch* CDECL fetch_next_prp_sparse_batch(Stream<SparseBatch>* stream) {
+        prp_last_error.clear();
+        try { return stream->next(); }
+        catch (const std::exception& e) { prp_last_error = e.what(); return nullptr; }
+    }
 
     EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping)
     {

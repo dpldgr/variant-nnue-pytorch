@@ -23,3 +23,11 @@ install(
   TARGETS training_data_loader
   RUNTIME DESTINATION .
   LIBRARY DESTINATION .)
+
+option(BUILD_PRP_TESTS "Build standalone permutation and indexed-reader tests" OFF)
+if(BUILD_PRP_TESTS)
+  enable_testing()
+  add_executable(test_prp_reader tests/test_prp_reader.cpp)
+  target_include_directories(test_prp_reader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME prp_reader COMMAND test_prp_reader)
+endif()

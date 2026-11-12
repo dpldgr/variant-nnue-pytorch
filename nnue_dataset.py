@@ -69,7 +69,8 @@ class TrainingDataProvider:
         batch_size=None,
         filtered=False,
         random_fen_skipping=0,
-        device='cpu'):
+        device='cpu',
+        stream_args=()):
 
         self.feature_set = feature_set.encode('utf-8')
         self.create_stream = create_stream
@@ -91,7 +92,8 @@ class TrainingDataProvider:
             self.batch_size,
             cyclic,
             filtered,
-            random_fen_skipping
+            random_fen_skipping,
+            *stream_args
         )
 
     def __iter__(self):
@@ -108,8 +110,12 @@ class TrainingDataProvider:
             raise StopIteration
 
     def __del__(self):
-        if hasattr(self, "stream"):
+        self.close()
+
+    def close(self):
+        if getattr(self, "stream", None):
             self.destroy_stream(self.stream)
+            self.stream = None
 
 create_sparse_batch_stream = dll.create_sparse_batch_stream
 create_sparse_batch_stream.restype = ctypes.c_void_p
@@ -174,3 +180,114 @@ class FixedNumBatchesDataset(Dataset):
 
   def __getitem__(self, idx):
     return next(self.iter)
+
+
+def _prp_api():
+    # Resolve only for PRP, so sequential mode still works with an older DLL.
+    try:
+        create = dll.create_prp_sparse_batch_stream
+        fetch = dll.fetch_next_prp_sparse_batch
+        count = dll.training_data_record_count
+        error = dll.get_prp_last_error
+    except AttributeError as exc:
+        raise RuntimeError('Rebuild the existing data-loader library to enable PRP loading.') from exc
+    create.restype = ctypes.c_void_p
+    create.argtypes = create_sparse_batch_stream.argtypes + [ctypes.c_uint64, ctypes.c_uint64]
+    fetch.restype = SparseBatchPtr
+    fetch.argtypes = [ctypes.c_void_p]
+    count.restype = ctypes.c_uint64
+    count.argtypes = [ctypes.c_char_p]
+    error.restype = ctypes.c_char_p
+    error.argtypes = []
+    return create, fetch, count, error
+
+
+def training_data_record_count(filename):
+    _, _, count, error = _prp_api()
+    result = count(os.fsencode(filename))
+    if not result:
+        raise RuntimeError(error().decode('utf-8', errors='replace'))
+    return result
+
+
+class PrpSparseBatchProvider(TrainingDataProvider):
+    def __init__(self, feature_set, filename, batch_size, num_workers=1,
+                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, epoch=0):
+        create, fetch, _, self.error = _prp_api()
+        super().__init__(feature_set, create, destroy_sparse_batch_stream, fetch,
+                         destroy_sparse_batch, filename, False, num_workers,
+                         batch_size, filtered, random_fen_skipping, device,
+                         stream_args=(seed, epoch))
+        if not self.stream:
+            raise RuntimeError(self.error().decode('utf-8', errors='replace'))
+
+    def __next__(self):
+        batch = self.fetch_next(self.stream)
+        if not batch:
+            error = self.error()
+            if error:
+                raise RuntimeError(error.decode('utf-8', errors='replace'))
+            raise StopIteration
+        try:
+            return batch.contents.get_tensors(self.device)
+        finally:
+            self.destroy_part(batch)
+
+
+class PrpBatchDataset(torch.utils.data.IterableDataset):
+    """One complete source traversal per iteration; no cyclic batch padding.
+
+    Length is intentionally unspecified: filtering changes the number of yielded
+    batches. Record counting and reads are delegated to the storage backend.
+    """
+    def __init__(self, feature_set, filename, batch_size, num_workers=1,
+                 filtered=False, random_fen_skipping=0, device='cpu', seed=42):
+        super().__init__()
+        if batch_size < 1 or num_workers < 1 or random_fen_skipping < 0:
+            raise ValueError('PRP requires positive batch size/workers and nonnegative skipping.')
+        self.feature_set = feature_set
+        self.filename = filename
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.filtered = filtered
+        self.random_fen_skipping = random_fen_skipping
+        self.device = device
+        self.seed = seed % (1 << 64)
+        self.record_count = training_data_record_count(filename)
+        self.next_epoch = 0
+        self.epoch_complete = True
+
+    def __iter__(self):
+        # Generator body starts when the loader consumes its first batch, not
+        # when an unused iterator is constructed during trainer setup.
+        if torch.utils.data.get_worker_info() is not None:
+            raise RuntimeError('Use native --num-workers, not Python DataLoader workers, with PRP.')
+        epoch = self.next_epoch
+        self.next_epoch += 1
+        self.epoch_complete = False
+        provider = PrpSparseBatchProvider(
+            self.feature_set, self.filename, self.batch_size, self.num_workers,
+            self.filtered, self.random_fen_skipping, self.device, self.seed, epoch)
+        try:
+            yield from provider
+            self.epoch_complete = True
+        finally:
+            provider.close()
+
+    def state_dict(self):
+        return dict(version=1, next_epoch=self.next_epoch, epoch_complete=self.epoch_complete, seed=self.seed,
+                    record_count=self.record_count, batch_size=self.batch_size,
+                    feature_set=self.feature_set, filtered=self.filtered,
+                    random_fen_skipping=self.random_fen_skipping)
+
+    def load_state_dict(self, state):
+        if not state.get('epoch_complete', False):
+            raise ValueError('PRP resumption currently requires a completed-epoch checkpoint.')
+        expected = self.state_dict()
+        for key in expected:
+            if key not in ('next_epoch', 'epoch_complete') and state.get(key) != expected[key]:
+                raise ValueError('PRP checkpoint does not match current loader setting: ' + key)
+        self.next_epoch = int(state['next_epoch'])
+        if self.next_epoch < 0:
+            raise ValueError('Invalid PRP checkpoint epoch.')
+        self.epoch_complete = True
