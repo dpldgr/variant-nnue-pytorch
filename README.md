@@ -108,6 +108,52 @@ Only Python changed for this feature; no data-loader library rebuild is needed.
 Run `python -m unittest discover -s tests -p test_score_targets.py -v` for the
 target, loss, checkpoint and serialization tests.
 
+## Training record size
+
+`--record-bytes N` accepts every integer from **7 through 144**, default **72**.
+It applies to both training and validation files, with either `--data-loader`
+mode. Rebuild the existing data-loader library to enable the new sizes.
+
+```bash
+python train.py metal-3p-7.bin metal-3p-7.bin --data-loader prp \
+    --record-bytes 7 --no-smart-fen-skipping --random-fen-skipping 0
+```
+
+- **72 bytes** keeps the existing `PackedSfenValue` layout and default reader.
+- **Other sizes** use the compact tablebase profile in
+  [`lib/compact_training_record.h`](lib/compact_training_record.h). It stores
+  placement, side to move, signed 16-bit score and WDL. There are two explicit
+  Kings, no hands, castling or en-passant rights, and no game history. Decoding
+  supplies zero move/rule50 and placeholder game ply/fullmove 1.
+
+The compact encoder chooses sparse square/type fields or an occupancy bitmap
+per record, whichever supports the placement at the selected width. With an
+8x8/five-non-King-type schema, 7 bytes hold up to four pieces including Kings;
+on 4x3 the same width holds six pieces. Capacity depends on the **configured**
+geometry and piece types, not only the selected material. A width that cannot
+hold the position is rejected, rather than truncating data. Existing 8-byte
+exports with at most 64 cells/eight non-King types remain byte compatible.
+
+Use the matching Fairy-Stockfish exporter, for example:
+
+```text
+mate-table pieces {K,N,k} export metal-3p-7.bin entrysize 7
+```
+
+Files remain headerless. Select the actual record width explicitly, and compile
+`variant.h` for the same board geometry, dense piece-type ordering and sufficient
+`PIECE_COUNT`. There is no format autodetection. Do not mix widths or schemas in
+one file; changing the width requires decoding/re-encoding, not padding or
+truncating existing records. The 72-byte option always means the original
+format, not a 72-byte compact record. Legacy `largedata` PackedSfen layouts are
+not selected by `--record-bytes 136`; that value selects compact records.
+
+PRP checkpoints retain the width for reference. A lossless conversion preserving
+the record count and order can resume with a different `--record-bytes`; supply
+the new width explicitly. Existing PRP checkpoints remain compatible. The
+backend owns byte offsets and decoding; the permutation still operates only on
+logical record indices, allowing other storage formats to be added later.
+
 ## Training record order
 
 `--data-loader sequential` is the default and preserves the existing reader,
@@ -149,7 +195,7 @@ state; `--resume-from-model` can initialize weights for a new PRP run instead.
 
 Record ordering uses logical indices through `IndexedTrainingDataSource`.
 The initial `.bin` backend owns file sizing, fixed-width offsets and decoding,
-using the record layout compiled into the existing library. Future variable-size
+using the selected record width and compiled variant schema. Future variable-size
 or compressed backends can implement indexed lookup without changing the PRP,
 epoch or batching layers. Malformed, empty and unsupported files are rejected.
 
@@ -160,6 +206,7 @@ cmake -S . -B build -DBUILD_PRP_TESTS=ON
 cmake --build build --parallel 2 --target install
 ctest --test-dir build --output-on-failure
 python -m unittest discover -s tests -p 'test_prp_*.py' -v
+python -m unittest discover -s tests -p test_record_bytes.py -v
 ```
 
 ## Training on GPU

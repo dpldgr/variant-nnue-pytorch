@@ -759,10 +759,49 @@ Stream<SparseBatch>* make_prp_stream(int concurrency, const char* filename, int 
     return new PrpFeaturedBatchStream<FeatureSetT, SparseBatch>(concurrency, batch_size, std::move(input));
 }
 
+template <typename FeatureSetT>
+Stream<SparseBatch>* make_sized_stream(int concurrency, const char* filename, int batch_size,
+    bool cyclic, bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch,
+    unsigned record_bytes, bool shuffle)
+{
+    auto source = training_data::open_indexed_training_data_source(filename, record_bytes);
+    auto skip = make_prp_skip_predicate(filtered, skipping, seed, epoch);
+    std::unique_ptr<training_data::BasicSfenInputStream> input;
+    if (shuffle) input = std::make_unique<training_data::PrpSfenInputStream>(std::move(source), seed, epoch, skip);
+    else input = std::make_unique<training_data::IndexedSequentialInputStream>(std::move(source), cyclic, skip);
+    return new PrpFeaturedBatchStream<FeatureSetT, SparseBatch>(concurrency, batch_size, std::move(input));
+}
+
 extern "C" {
 
     // Additional entry points in the SAME library. The legacy ABI is unchanged.
     EXPORT const char* CDECL get_prp_last_error() { return prp_last_error.c_str(); }
+
+    EXPORT std::uint64_t CDECL training_data_record_count_sized(const char* filename, unsigned record_bytes) {
+        prp_last_error.clear();
+        try { return training_data::open_indexed_training_data_source(filename, record_bytes)->record_count(); }
+        catch (const std::exception& e) { prp_last_error = e.what(); return 0; }
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL create_sized_sparse_batch_stream(
+        const char* feature_set_c, int concurrency, const char* filename, int batch_size,
+        bool cyclic, bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch,
+        unsigned record_bytes, bool shuffle)
+    {
+        prp_last_error.clear();
+        try {
+            if ((shuffle && cyclic) || concurrency < 1 || batch_size < 1)
+                throw std::invalid_argument("Invalid sized-reader batch/workers/epoch settings");
+            std::string_view feature_set(feature_set_c);
+            if (feature_set == "HalfKP") return make_sized_stream<FeatureSet<HalfKP>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
+            if (feature_set == "HalfKP^") return make_sized_stream<FeatureSet<HalfKPFactorized>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
+            if (feature_set == "HalfKA") return make_sized_stream<FeatureSet<HalfKA>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
+            if (feature_set == "HalfKA^") return make_sized_stream<FeatureSet<HalfKAFactorized>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
+            if (feature_set == "HalfKAv2") return make_sized_stream<FeatureSet<HalfKAv2>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
+            if (feature_set == "HalfKAv2^") return make_sized_stream<FeatureSet<HalfKAv2Factorized>>(concurrency, filename, batch_size, cyclic, filtered, skipping, seed, epoch, record_bytes, shuffle);
+            throw std::invalid_argument("Unknown feature_set: " + std::string(feature_set));
+        } catch (const std::exception& e) { prp_last_error = e.what(); return nullptr; }
+    }
 
     EXPORT std::uint64_t CDECL training_data_record_count(const char* filename) {
         prp_last_error.clear();

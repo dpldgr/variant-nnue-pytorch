@@ -30,12 +30,12 @@ class PrpLoaderState(pl.Callback):
       raise ValueError('PRP checkpoint has no loader state. Use a PRP epoch-boundary checkpoint, or initialize weights with --resume-from-model.')
 
 
-def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size, data_loader='sequential', seed=42):
+def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size, data_loader='sequential', seed=42, record_bytes=72):
   features_name = feature_set.name
   if data_loader == 'prp':
     dataset = nnue_dataset.PrpBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
                                           filtered=filtered, random_fen_skipping=random_fen_skipping,
-                                          device=main_device, seed=seed)
+                                          device=main_device, seed=seed, record_bytes=record_bytes)
     if epoch_size is not None and epoch_size != dataset.record_count:
       raise ValueError('--epoch-size must match the dataset record count ({}) with --data-loader prp.'.format(dataset.record_count))
     train = DataLoader(dataset, batch_size=None, batch_sampler=None)
@@ -43,12 +43,12 @@ def make_data_loaders(train_filename, val_filename, feature_set, num_workers, ba
   elif data_loader == 'sequential':
     epoch_size = 20000000 if epoch_size is None else epoch_size
     train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, record_bytes=record_bytes)
     train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
   else:
     raise ValueError('Unknown data loader: ' + data_loader)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device)
+                                                   random_fen_skipping=random_fen_skipping, device=main_device, record_bytes=record_bytes)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   val = DataLoader(nnue_dataset.FixedNumBatchesDataset(val_infinite, (val_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -65,6 +65,13 @@ def main():
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
   parser.add_argument("--seed", default=42, type=int, dest='seed', help="torch seed to use.")
   parser.add_argument("--data-loader", choices=('sequential', 'prp'), default='sequential', help="Training record order. Default: sequential. PRP traverses the whole dataset once per epoch.")
+  def record_bytes(text):
+    try:
+      return nnue_dataset.validate_record_bytes(int(text))
+    except ValueError as exc:
+      raise argparse.ArgumentTypeError(str(exc)) from exc
+  parser.add_argument('--record-bytes', type=record_bytes, default=72,
+                      help='Bytes per record in both input files, integer 7..144 (default: 72).')
   parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping_deprecated', help="If enabled positions that are bad training targets will be skipped during loading. Default: True, kept for backwards compatibility. This option is ignored")
   parser.add_argument("--no-smart-fen-skipping", action='store_true', dest='no_smart_fen_skipping', help="If used then no smart fen skipping will be done. By default smart fen skipping is done.")
   parser.add_argument("--random-fen-skipping", default=3, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
@@ -125,7 +132,7 @@ def main():
   main_device = trainer.strategy.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
 
   print('Using c++ data loader ({})'.format(args.data_loader))
-  train, val = make_data_loaders(args.train, args.val, feature_set, args.num_workers, batch_size, not args.no_smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.validation_size, args.data_loader, args.seed)
+  train, val = make_data_loaders(args.train, args.val, feature_set, args.num_workers, batch_size, not args.no_smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.validation_size, args.data_loader, args.seed, args.record_bytes)
   if args.data_loader == 'prp':
     trainer.callbacks.append(PrpLoaderState(train.dataset))
 

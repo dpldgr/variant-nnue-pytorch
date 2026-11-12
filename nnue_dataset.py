@@ -138,7 +138,17 @@ destroy_sparse_batch = dll.destroy_sparse_batch
 
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', record_bytes=72):
+        self.record_bytes = validate_record_bytes(record_bytes)
+        if record_bytes != 72:
+            create, fetch, _, self.error = _sized_api()
+            super().__init__(feature_set, create, destroy_sparse_batch_stream, fetch,
+                             destroy_sparse_batch, filename, cyclic, num_workers,
+                             batch_size, filtered, random_fen_skipping, device,
+                             stream_args=(42, 0, record_bytes, False))
+            if not self.stream:
+                raise RuntimeError(self.error().decode('utf-8', errors='replace'))
+            return
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
@@ -153,8 +163,11 @@ class SparseBatchProvider(TrainingDataProvider):
             random_fen_skipping,
             device)
 
+    def __next__(self):
+        return super().__next__() if self.record_bytes == 72 else _checked_next(self)
+
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+  def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', record_bytes=72):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
     self.filename = filename
@@ -164,9 +177,10 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.filtered = filtered
     self.random_fen_skipping = random_fen_skipping
     self.device = device
+    self.record_bytes = validate_record_bytes(record_bytes)
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device)
+    return SparseBatchProvider(self.feature_set, self.filename, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, record_bytes=self.record_bytes)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):
@@ -202,9 +216,44 @@ def _prp_api():
     return create, fetch, count, error
 
 
-def training_data_record_count(filename):
-    _, _, count, error = _prp_api()
-    result = count(os.fsencode(filename))
+def validate_record_bytes(value):
+    if not isinstance(value, int) or not 7 <= value <= 144:
+        raise ValueError('record bytes must be an integer in 7..144')
+    return value
+
+
+def _sized_api():
+    try:
+        create = dll.create_sized_sparse_batch_stream
+        count = dll.training_data_record_count_sized
+    except AttributeError as exc:
+        raise RuntimeError('Rebuild the data-loader library for --record-bytes support.') from exc
+    _, fetch, _, error = _prp_api()
+    create.restype = ctypes.c_void_p
+    create.argtypes = create_sparse_batch_stream.argtypes + [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint, ctypes.c_bool]
+    count.restype = ctypes.c_uint64
+    count.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    return create, fetch, count, error
+
+
+def _checked_next(provider):
+    batch = provider.fetch_next(provider.stream)
+    if not batch:
+        error = provider.error()
+        if error:
+            raise RuntimeError(error.decode('utf-8', errors='replace'))
+        raise StopIteration
+    try:
+        return batch.contents.get_tensors(provider.device)
+    finally:
+        provider.destroy_part(batch)
+
+
+def training_data_record_count(filename, record_bytes=72):
+    validate_record_bytes(record_bytes)
+    _, _, count, error = _prp_api() if record_bytes == 72 else _sized_api()
+    args = () if record_bytes == 72 else (record_bytes,)
+    result = count(os.fsencode(filename), *args)
     if not result:
         raise RuntimeError(error().decode('utf-8', errors='replace'))
     return result
@@ -212,26 +261,19 @@ def training_data_record_count(filename):
 
 class PrpSparseBatchProvider(TrainingDataProvider):
     def __init__(self, feature_set, filename, batch_size, num_workers=1,
-                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, epoch=0):
-        create, fetch, _, self.error = _prp_api()
+                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, epoch=0, record_bytes=72):
+        validate_record_bytes(record_bytes)
+        create, fetch, _, self.error = _prp_api() if record_bytes == 72 else _sized_api()
+        args = (seed, epoch) if record_bytes == 72 else (seed, epoch, record_bytes, True)
         super().__init__(feature_set, create, destroy_sparse_batch_stream, fetch,
                          destroy_sparse_batch, filename, False, num_workers,
                          batch_size, filtered, random_fen_skipping, device,
-                         stream_args=(seed, epoch))
+                         stream_args=args)
         if not self.stream:
             raise RuntimeError(self.error().decode('utf-8', errors='replace'))
 
     def __next__(self):
-        batch = self.fetch_next(self.stream)
-        if not batch:
-            error = self.error()
-            if error:
-                raise RuntimeError(error.decode('utf-8', errors='replace'))
-            raise StopIteration
-        try:
-            return batch.contents.get_tensors(self.device)
-        finally:
-            self.destroy_part(batch)
+        return _checked_next(self)
 
 
 class PrpBatchDataset(torch.utils.data.IterableDataset):
@@ -241,7 +283,7 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
     batches. Record counting and reads are delegated to the storage backend.
     """
     def __init__(self, feature_set, filename, batch_size, num_workers=1,
-                 filtered=False, random_fen_skipping=0, device='cpu', seed=42):
+                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, record_bytes=72):
         super().__init__()
         if batch_size < 1 or num_workers < 1 or random_fen_skipping < 0:
             raise ValueError('PRP requires positive batch size/workers and nonnegative skipping.')
@@ -253,7 +295,8 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         self.random_fen_skipping = random_fen_skipping
         self.device = device
         self.seed = seed % (1 << 64)
-        self.record_count = training_data_record_count(filename)
+        self.record_bytes = validate_record_bytes(record_bytes)
+        self.record_count = training_data_record_count(filename, record_bytes)
         self.next_epoch = 0
         self.epoch_complete = True
 
@@ -267,7 +310,7 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         self.epoch_complete = False
         provider = PrpSparseBatchProvider(
             self.feature_set, self.filename, self.batch_size, self.num_workers,
-            self.filtered, self.random_fen_skipping, self.device, self.seed, epoch)
+            self.filtered, self.random_fen_skipping, self.device, self.seed, epoch, self.record_bytes)
         try:
             yield from provider
             self.epoch_complete = True
@@ -278,14 +321,16 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         return dict(version=1, next_epoch=self.next_epoch, epoch_complete=self.epoch_complete, seed=self.seed,
                     record_count=self.record_count, batch_size=self.batch_size,
                     feature_set=self.feature_set, filtered=self.filtered,
-                    random_fen_skipping=self.random_fen_skipping)
+                    random_fen_skipping=self.random_fen_skipping, record_bytes=self.record_bytes)
 
     def load_state_dict(self, state):
         if not state.get('epoch_complete', False):
             raise ValueError('PRP resumption currently requires a completed-epoch checkpoint.')
         expected = self.state_dict()
         for key in expected:
-            if key not in ('next_epoch', 'epoch_complete') and state.get(key) != expected[key]:
+            # A lossless conversion can change record width without changing
+            # logical positions or permutation state. Legacy states omit it.
+            if key not in ('next_epoch', 'epoch_complete', 'record_bytes') and state.get(key) != expected[key]:
                 raise ValueError('PRP checkpoint does not match current loader setting: ' + key)
         self.next_epoch = int(state['next_epoch'])
         if self.next_epoch < 0:
