@@ -55,7 +55,7 @@ def make_data_loaders(train_filename, val_filename, feature_set, num_workers, ba
   val = DataLoader(nnue_dataset.FixedNumBatchesDataset(val_infinite, (val_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
   return train, val
 
-def main():
+def parse_args(argv=None):
   parser = argparse.ArgumentParser(description="Trains the network.")
   parser.add_argument("train", help="Training data (.bin)")
   parser.add_argument("val", help="Validation data (.bin)")
@@ -73,15 +73,23 @@ def main():
       raise argparse.ArgumentTypeError(str(exc)) from exc
   parser.add_argument('--record-bytes', type=record_bytes, default=72,
                       help='Bytes per record in both input files, integer 7..144 (default: 72).')
-  parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping_deprecated', help="If enabled positions that are bad training targets will be skipped during loading. Default: True, kept for backwards compatibility. This option is ignored")
-  parser.add_argument("--no-smart-fen-skipping", action='store_true', dest='no_smart_fen_skipping', help="If used then no smart fen skipping will be done. By default smart fen skipping is done.")
-  parser.add_argument("--random-fen-skipping", default=3, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
+  parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping_deprecated', help="Enable smart fen skipping (default: enabled for sequential, disabled for PRP). --no-smart-fen-skipping takes precedence if both are supplied.")
+  parser.add_argument("--no-smart-fen-skipping", action='store_true', default=None, dest='no_smart_fen_skipping', help="Disable smart fen skipping (default for PRP). Sequential enables it unless disabled explicitly.")
+  parser.add_argument("--random-fen-skipping", default=None, type=int, dest='random_fen_skipping', help="Skip fens randomly on average this many before using one (default: 3 for sequential, 0 for PRP).")
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument("--epoch-size", type=int, default=None, dest='epoch_size', help="Positions per sequential epoch (default: 20000000). If specified for PRP, must equal the dataset record count.")
   parser.add_argument("--validation-size", type=int, default=1000000, dest='validation_size', help="Number of positions per validation step.")
   score_targets.add_argparse_args(parser)
   features.add_argparse_args(parser)
-  args = parser.parse_args()
+  args = parser.parse_args(argv)
+  if args.no_smart_fen_skipping is None:
+    args.no_smart_fen_skipping = args.data_loader == 'prp' and not args.smart_fen_skipping_deprecated
+  if args.random_fen_skipping is None:
+    args.random_fen_skipping = 0 if args.data_loader == 'prp' else 3
+  return args
+
+def main():
+  args = parse_args()
 
   if not os.path.exists(args.train):
     raise Exception('{0} does not exist'.format(args.train))

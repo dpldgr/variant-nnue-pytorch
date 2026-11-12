@@ -181,8 +181,7 @@ default). Validation continues to use that sequential pipeline in both modes.
 To shuffle records as they are read, without rewriting the dataset:
 
 ```bash
-python train.py train_data.bin val_data.bin --data-loader prp \
-    --no-smart-fen-skipping --random-fen-skipping 0
+python train.py train_data.bin val_data.bin --data-loader prp
 ```
 
 Rebuild the existing data-loader library before selecting `prp`; there is no
@@ -195,9 +194,12 @@ One PRP epoch is one complete dataset traversal. The final batch can be smaller;
 it never wraps into the next epoch. Omit `--epoch-size` for automatic counting,
 or supply the actual record count. Other values are rejected in PRP mode.
 Filtering/skipping remain available and run after record selection: skipped
-records are visited but not trained on. Their existing defaults are unchanged,
-including random skipping of 3. Trainer limits such as `--limit_train_batches`
-can deliberately interrupt a traversal.
+records are visited but not trained on. PRP defaults to no smart skipping and
+random skipping of 0; sequential retains smart skipping and random skipping of
+3. Use `--smart-fen-skipping` or `--random-fen-skipping N` to opt into skipping
+with PRP. These settings also apply to the sequential validation reader.
+Trainer limits such as `--limit_train_batches` can deliberately interrupt a
+traversal.
 
 PRP epochs are finite iterable datasets whose batch count depends on filtering;
 the trainer may therefore display an unknown batch total. Fractional batch limits

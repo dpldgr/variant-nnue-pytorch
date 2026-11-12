@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 import torch
 
 import nnue_dataset as data
-from train import make_data_loaders, PrpLoaderState
+from train import make_data_loaders, parse_args, PrpLoaderState
 from test_prp_loader import write_records
 
 
@@ -104,6 +104,38 @@ class PrpTrainerTest(unittest.TestCase):
         self.assertEqual(sum(len(b[7]) for b in prp), 257)
         with self.assertRaisesRegex(ValueError, '--epoch-size'):
             self.loaders(epoch_size=256)
+
+    def test_prp_cli_defaults_keep_every_record(self):
+        args = parse_args([self.path, self.path, '--data-loader', 'prp'])
+        self.assertTrue(args.no_smart_fen_skipping)
+        self.assertEqual(args.random_fen_skipping, 0)
+        train, _ = make_data_loaders(args.train, args.val, FeatureSet(), 4, 64,
+                                    not args.no_smart_fen_skipping, args.random_fen_skipping,
+                                    'cpu', None, 0, args.data_loader, args.seed)
+        scores = [int(x) for batch in train for x in batch[7].reshape(-1).tolist()]
+        self.assertEqual(sorted(scores), list(range(257)))
+
+    def test_sequential_cli_defaults_unchanged(self):
+        for options in ([], ['--data-loader', 'sequential']):
+            with self.subTest(options=options):
+                args = parse_args([self.path, self.path, *options])
+                self.assertFalse(args.no_smart_fen_skipping)
+                self.assertEqual(args.random_fen_skipping, 3)
+
+    def test_cli_skipping_overrides(self):
+        for loader in ('sequential', 'prp'):
+            for random_skip in (0, 7):
+                with self.subTest(loader=loader, random_skip=random_skip):
+                    args = parse_args([self.path, self.path, '--data-loader', loader,
+                                       '--smart-fen-skipping', '--random-fen-skipping', str(random_skip)])
+                    self.assertFalse(args.no_smart_fen_skipping)
+                    self.assertEqual(args.random_fen_skipping, random_skip)
+            for smart_options in (['--no-smart-fen-skipping'],
+                                  ['--smart-fen-skipping', '--no-smart-fen-skipping'],
+                                  ['--no-smart-fen-skipping', '--smart-fen-skipping']):
+                with self.subTest(loader=loader, options=smart_options):
+                    args = parse_args([self.path, self.path, '--data-loader', loader, *smart_options])
+                    self.assertTrue(args.no_smart_fen_skipping)
 
 
 if __name__ == '__main__':

@@ -8,11 +8,13 @@ The library is CPU-only and does not link to Python, PyTorch or CUDA.
 
 ```sh
 python train.py train.bin val.bin --variant-config configs/metal-chess.json \
-  --data-loader prp --record-bytes 7 --no-smart-fen-skipping --random-fen-skipping 0
+  --data-loader prp --record-bytes 7
 ```
 
 The default is the bundled `variant.json`. `configs/metal-chess.json` uses the
 user-supplied Metal Chess piece values. All existing training options remain.
+PRP defaults to no smart or random skipping; sequential retains smart skipping
+and random skipping of 3. Explicit skipping options override these defaults.
 Record width 72 is PackedSfen; other widths in 7..144 use compact records.
 Formats remain headerless, so select the correct JSON and record width.
 
