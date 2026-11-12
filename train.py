@@ -3,6 +3,7 @@ import model as M
 import nnue_dataset
 import pytorch_lightning as pl
 import features
+import score_targets
 import os
 import torch
 from torch import set_num_threads as t_set_num_threads
@@ -70,6 +71,7 @@ def main():
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument("--epoch-size", type=int, default=None, dest='epoch_size', help="Positions per sequential epoch (default: 20000000). If specified for PRP, must equal the dataset record count.")
   parser.add_argument("--validation-size", type=int, default=1000000, dest='validation_size', help="Number of positions per validation step.")
+  score_targets.add_argparse_args(parser)
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -88,6 +90,8 @@ def main():
     nnue = torch.load(args.resume_from_model, weights_only=False)
     nnue.set_feature_set(feature_set)
     nnue.lambda_ = args.lambda_
+
+  nnue.set_score_target_overrides(args.score_target, args.score_target_scale)
 
   print("Feature set: {}".format(feature_set.name))
   print("Num real features: {}".format(feature_set.num_real_features))

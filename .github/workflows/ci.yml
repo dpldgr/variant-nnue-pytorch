@@ -55,6 +55,7 @@ jobs:
           cmake --build build --parallel 2
           ctest --test-dir build --output-on-failure
           python -m unittest discover -s tests -p 'test_prp_*.py' -v
+          python -m unittest discover -s tests -p test_score_targets.py -v
 
       - name: End-to-end training smoke test
         run: scripts/cpu_smoke_test.sh variant-nnue-tools/src/stockfish smoke_test

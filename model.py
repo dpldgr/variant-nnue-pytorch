@@ -4,6 +4,7 @@ from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import copy
+import score_targets
 from feature_transformer import DoubleFeatureTransformerSlice
 
 # 3 layer fully connected network
@@ -119,7 +120,7 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=1.0):
+  def __init__(self, feature_set, lambda_=1.0, score_target=None, score_target_scale=None):
     super(NNUE, self).__init__()
     self.num_psqt_buckets = feature_set.num_psqt_buckets
     self.num_ls_buckets = feature_set.num_ls_buckets
@@ -135,6 +136,41 @@ class NNUE(pl.LightningModule):
     ]
 
     self._init_layers()
+    self.set_score_target_overrides(score_target, score_target_scale)
+
+  def set_score_target(self, name=None, scale=None):
+    current = getattr(self, 'score_target', None)
+    name = name if name is not None else (current.name if current is not None else 'sigmoid')
+    scale = scale if scale is not None else (current.scale if current is not None else score_targets.DEFAULT_SCALE)
+    self.score_target = score_targets.ScoreTarget(name, scale).to(self.input.weight.device)
+    self.save_hyperparameters(dict(score_target=name, score_target_scale=float(scale)))
+
+  def set_score_target_overrides(self, name=None, scale=None):
+    # Explicit CLI options override a saved configuration. Omitted options
+    # preserve .pt settings now and checkpoint settings during on_load_checkpoint.
+    self._score_target_overrides = dict(name=name, scale=scale)
+    self.set_score_target(name, scale)
+
+  def on_save_checkpoint(self, checkpoint):
+    checkpoint['score_target'] = self.score_target.config()
+
+  def on_load_checkpoint(self, checkpoint):
+    hparams = checkpoint.get('hyper_parameters', {})
+    config = checkpoint.get('score_target', dict(
+        version=score_targets.VERSION, name=hparams.get('score_target', 'sigmoid'),
+        scale=hparams.get('score_target_scale', score_targets.DEFAULT_SCALE)))
+    if config.get('version') != score_targets.VERSION:
+      raise ValueError('Unsupported score-target checkpoint version.')
+    overrides = getattr(self, '_score_target_overrides', {})
+    name = overrides.get('name')
+    scale = overrides.get('scale')
+    self.set_score_target(config['name'] if name is None else name,
+                          config['scale'] if scale is None else scale)
+
+  def on_train_start(self):
+    target = self.score_target
+    self.print('Score target: {} (T={} plies)'.format(target.name, target.scale)
+               if target.name != 'sigmoid' else 'Score target: sigmoid (score / 410)')
 
   '''
   We zero all real feature weights because we want to start the training
@@ -264,12 +300,11 @@ class NNUE(pl.LightningModule):
     # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
     # This needs to match the value used in the serializer
     nnue2score = 600
-    in_scaling = 410
     out_scaling = 361
 
     q = (self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices) * nnue2score / out_scaling).sigmoid()
     t = outcome
-    p = (score / in_scaling).sigmoid()
+    p = self.score_target(score)
 
     loss_eval = (p - q).square().mean()
     loss_result = (q - t).square().mean()

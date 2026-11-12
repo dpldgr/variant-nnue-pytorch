@@ -40,8 +40,8 @@ class PrpTrainerTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def loaders(self, mode='prp', epoch_size=None, skipping=0):
-        return make_data_loaders(self.path, self.path, FeatureSet(), 4, 64, False,
+    def loaders(self, mode='prp', epoch_size=None, skipping=0, workers=4):
+        return make_data_loaders(self.path, self.path, FeatureSet(), workers, 64, False,
                                  skipping, 'cpu', epoch_size, 0, mode, 42)
 
     def trainer(self, loader, epochs, folder):
@@ -91,7 +91,10 @@ class PrpTrainerTest(unittest.TestCase):
             self.assertTrue(0 < len(model.observed[epoch]) < 257)
 
     def test_epoch_size_and_sequential_compatibility(self):
-        sequential, _ = self.loaders('sequential', epoch_size=257)
+        # Legacy multi-worker batches are delivered in completion order, so
+        # ordered sequential parity must use one worker. PRP ordering is tested
+        # independently with multiple workers above and in test_prp_loader.py.
+        sequential, _ = self.loaders('sequential', epoch_size=257, workers=1)
         self.assertIsInstance(sequential.dataset, data.FixedNumBatchesDataset)
         batches = list(sequential)
         self.assertEqual([len(b[7]) for b in batches], [64] * 5)

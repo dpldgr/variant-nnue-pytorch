@@ -48,6 +48,66 @@ python train.py train_data.bin val_data.bin
 python train.py --resume_from_checkpoint <path> ...
 ```
 
+## Score targets
+
+`--score-target` selects how the training score is converted to the evaluation
+target. It is independent of `--data-loader`, and works with both readers:
+
+```bash
+python train.py train_data.bin val_data.bin --data-loader prp \
+    --score-target linear-invlog --score-target-scale 64 \
+    --no-smart-fen-skipping --random-fen-skipping 0
+```
+
+New runs default to `sigmoid`, the unchanged `sigmoid(score / 410)` expression.
+The other modes expect game-theoretic records: a draw is score 0, and a decisive
+score is signed `(32000 - DTM)`, with DTM in plies. Scores outside +/-32000 are
+treated as terminal results (DTM 0). They are not centipawn target mappings.
+
+For all DTM modes, the winning target starts at 1 and approaches 0.6; the losing
+target is its complement, starting at 0 and approaching 0.4. Draws stay at 0.5.
+Shorter wins and longer survival therefore remain preferable under the existing
+engine evaluation convention. The prediction sigmoid, MSE loss, `--lambda`
+result blending, NNUE architecture and exported format are unchanged.
+
+Let `x = DTM / T`, with `--score-target-scale T` defaulting to **64 plies**.
+These are the report's curves, scaled to the same initial winning-target slope
+of `-0.2/T`:
+
+| Mode | Winning target |
+|---|---|
+| `sigmoid` | Existing `sigmoid(score / 410)`; T is unused |
+| `tanh` | `1 - 0.4*tanh(x/2)` |
+| `a-law` | `1 - 0.4*C_A(z)`; bounded-input A-law below |
+| `mu-law` | `1 - 0.4*C_mu(z)`; bounded-input mu-law below |
+| `linear-invlog` | `1 - 0.2*x` for x <= 1, then `0.6 + 0.2/(1+log(x))` |
+| `linear-exp` | `1 - 0.2*x` for x <= 1, then `0.6 + 0.2*exp(-(x-1))` |
+| `linear-recip` | `1 - 0.2*x` for x <= 1, then `0.6 + 0.2/x` |
+
+The A-law mode uses `A = 87.6`, `z = x/(x + 2*A/(1+log(A)))`, and
+`C_A(z) = A*z/(1+log(A))` for z <= 1/A, otherwise
+`C_A(z) = (1+log(A*z))/(1+log(A))`. The mu-law mode uses `mu = 255`,
+`z = x/(x + 2*mu/log(1+mu))`, and `C_mu(z) = log(1+mu*z)/log(1+mu)`.
+These bounded-input adaptations do not require a maximum DTM for normalization.
+The three `linear-*` curves have matching values and slopes at x=1. A-law is
+exactly linear in its initial z interval, approximately linear in DTM.
+
+Each DTM mapping is precomputed once on initialization into a 65,536-entry,
+float32 lookup table (256 KiB) covering the current signed-16-bit score format.
+The buffer moves to the training device with the model and is not part of the
+learned weights or checkpoint state_dict. Training batches perform only lookup;
+the default sigmoid keeps its original expression. The continuous curve code
+is separate from this record-format adapter for future score representations.
+
+Checkpoints and `.pt` models retain the chosen mapping and scale. Omit the flags
+when resuming to inherit them, or pass flags explicitly to change the objective.
+Legacy checkpoints with no target settings default to sigmoid unless overridden.
+An inference-only `.nnue` does not store training-target settings.
+
+Only Python changed for this feature; no data-loader library rebuild is needed.
+Run `python -m unittest discover -s tests -p test_score_targets.py -v` for the
+target, loss, checkpoint and serialization tests.
+
 ## Training record order
 
 `--data-loader sequential` is the default and preserves the existing reader,
