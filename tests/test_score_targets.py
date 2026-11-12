@@ -127,6 +127,31 @@ class ScoreTargetTest(unittest.TestCase):
 
 
 class ModelTargetTest(unittest.TestCase):
+    def test_checkpoint_uses_position_weighted_epoch_loss(self):
+        from train import make_checkpoint_callback
+
+        class CaptureLosses(pl.Callback):
+            def __init__(self):
+                self.batches = []
+
+            def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                self.batches.append((outputs['loss'].detach().item(), batch[7].shape[0]))
+
+        with tempfile.TemporaryDirectory() as folder:
+            data = batch()
+            loader = DataLoader([tuple(t[:4] for t in data), tuple(t[4:] for t in data)], batch_size=None)
+            checkpoint = make_checkpoint_callback(dirpath=folder)
+            captured = CaptureLosses()
+            model = models.NNUE(TinyFeatures(), score_target='linear-recip')
+            trainer = pl.Trainer(max_epochs=1, accelerator='cpu', devices=1, logger=False,
+                                 enable_progress_bar=False, enable_model_summary=False,
+                                 limit_val_batches=0, callbacks=[checkpoint, captured])
+            trainer.fit(model, loader)
+            expected = sum(loss * size for loss, size in captured.batches) / 5
+            self.assertAlmostEqual(checkpoint.best_model_score.item(), expected, places=7)
+            self.assertIn('train_loss', trainer.logged_metrics)
+            self.assertTrue(pathlib.Path(checkpoint.last_model_path).is_file())
+
     def test_loss_gradients_and_lambda_blending(self):
         model = models.NNUE(TinyFeatures())
         b = batch()

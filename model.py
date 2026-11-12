@@ -326,6 +326,11 @@ class NNUE(pl.LightningModule):
     loss = self.lambda_ * loss_eval + (1.0 - self.lambda_) * loss_result
 
     self.log(loss_type, loss)
+    if loss_type == 'train_loss':
+      # Keep the existing step curve and rank checkpoints by a position-weighted
+      # epoch mean, including PRP's smaller final batch.
+      self.log('train_loss_epoch', loss, on_step=False, on_epoch=True,
+               batch_size=score.shape[0])
 
     return loss
 

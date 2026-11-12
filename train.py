@@ -55,6 +55,12 @@ def make_data_loaders(train_filename, val_filename, feature_set, num_workers, ba
   val = DataLoader(nnue_dataset.FixedNumBatchesDataset(val_infinite, (val_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
   return train, val
 
+def make_checkpoint_callback(save_top_k=10, **kwargs):
+  return pl.callbacks.ModelCheckpoint(
+      monitor='train_loss_epoch', mode='min', save_top_k=save_top_k,
+      save_last=True, every_n_epochs=1, save_on_train_epoch_end=True,
+      filename='{epoch:03d}-{step}-{train_loss_epoch:.8g}', **kwargs)
+
 def parse_args(argv=None):
   parser = argparse.ArgumentParser(description="Trains the network.")
   parser.add_argument("train", help="Training data (.bin)")
@@ -79,9 +85,13 @@ def parse_args(argv=None):
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument("--epoch-size", type=int, default=None, dest='epoch_size', help="Positions per sequential epoch (default: 20000000). If specified for PRP, must equal the dataset record count.")
   parser.add_argument("--validation-size", type=int, default=1000000, dest='validation_size', help="Number of positions per validation step.")
+  parser.add_argument('--save-top-k', type=int, default=10,
+                      help='Keep this many checkpoints with the lowest epoch training loss (default: 10; -1 keeps all, 0 keeps only last.ckpt).')
   score_targets.add_argparse_args(parser)
   features.add_argparse_args(parser)
   args = parser.parse_args(argv)
+  if args.save_top_k < -1:
+    parser.error('--save-top-k must be -1 or a nonnegative integer')
   if args.no_smart_fen_skipping is None:
     args.no_smart_fen_skipping = args.data_loader == 'prp' and not args.smart_fen_skipping_deprecated
   if args.random_fen_skipping is None:
@@ -135,7 +145,7 @@ def main():
   print('Using log dir {}'.format(logdir), flush=True)
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
-  checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True, every_n_epochs=1, save_top_k=-1)
+  checkpoint_callback = make_checkpoint_callback(args.save_top_k)
   trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
 
   main_device = trainer.strategy.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)

@@ -66,6 +66,17 @@ python train.py train_data.bin val_data.bin
 python train.py --resume_from_checkpoint <path> ...
 ```
 
+## Checkpoint selection
+
+By default, keep the **10 checkpoints with the lowest epoch training loss**,
+plus `last.ckpt` for resuming. The `train_loss_epoch` metric averages losses over
+all positions in the epoch, weighting partial batches by their actual size.
+The existing `train_loss` step curve is retained. Validation can be disabled
+(`--limit_val_batches 0`) without affecting checkpoint selection.
+
+Use `--save-top-k N` to change retention: `-1` keeps every epoch, and `0` keeps
+only `last.ckpt`. These settings apply to both loaders and all score targets.
+
 ## Score targets
 
 `--score-target` selects how the training score is converted to the evaluation

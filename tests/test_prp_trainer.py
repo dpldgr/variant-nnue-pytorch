@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 import torch
 
 import nnue_dataset as data
-from train import make_data_loaders, parse_args, PrpLoaderState
+from train import make_checkpoint_callback, make_data_loaders, parse_args, PrpLoaderState
 from test_prp_loader import write_records
 
 
@@ -136,6 +136,37 @@ class PrpTrainerTest(unittest.TestCase):
                 with self.subTest(loader=loader, options=smart_options):
                     args = parse_args([self.path, self.path, '--data-loader', loader, *smart_options])
                     self.assertTrue(args.no_smart_fen_skipping)
+
+    def test_top_ten_checkpoints_and_last_survive_resume(self):
+        losses = [30, 5, 18, 3, 19, 1, 20, 9, 13, 7, 21, 11, 0.5, 25, 6]
+
+        class ScheduledModel(ToyModel):
+            def training_step(self, batch, batch_idx):
+                loss = super().training_step(batch, batch_idx)
+                self.log('train_loss_epoch', float(losses[self.current_epoch]),
+                         on_step=False, on_epoch=True, batch_size=len(batch[7]))
+                return loss
+
+        def fit(epochs, checkpoint_path=None):
+            train, _ = self.loaders()
+            checkpoint = make_checkpoint_callback(dirpath=str(self.root / 'ranked'))
+            trainer = pl.Trainer(max_epochs=epochs, accelerator='cpu', devices=1,
+                                 logger=False, enable_progress_bar=False, enable_model_summary=False,
+                                 limit_val_batches=0, num_sanity_val_steps=0,
+                                 callbacks=[checkpoint, PrpLoaderState(train.dataset)])
+            trainer.fit(ScheduledModel(), train, ckpt_path=checkpoint_path)
+            return checkpoint
+
+        first = fit(8)
+        saved = fit(len(losses), first.last_model_path)
+        expected = set(sorted(range(len(losses)), key=losses.__getitem__)[:10])
+        actual = {torch.load(path, map_location='cpu', weights_only=False)['epoch']
+                  for path in saved.best_k_models}
+        self.assertEqual(actual, expected)
+        last = torch.load(saved.last_model_path, map_location='cpu', weights_only=False)
+        self.assertEqual(last['epoch'], len(losses) - 1)
+        self.assertEqual(last['callbacks']['PrpLoaderState']['next_epoch'], len(losses))
+        self.assertEqual(len(list((self.root / 'ranked').glob('*.ckpt'))), 11)
 
 
 if __name__ == '__main__':
