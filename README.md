@@ -292,3 +292,9 @@ tensorboard --logdir=logs
 ```
 Then, go to http://localhost:6006/
 
+
+### DTX distance training files
+
+The generic loader supports `.dtx` files exported by `mate-table`, using the
+file header to determine the fixed stride. Existing `.bin` encoding and
+`--record-bytes` behaviour are unchanged. See [DTX format and usage](docs/dtx-format.md).

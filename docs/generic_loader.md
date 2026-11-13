@@ -122,3 +122,9 @@ also exercise interleaved contexts, large coordinates/types, native errors,
 checkpoint mismatch checks, and all record widths. No fixed global maximum-board
 allocation is imposed on ordinary small-board streams. Decoder and signed-int32
 feature-ID limits are checked before unsupported data is processed.
+
+## DTX distance training files
+
+The loader also reads header-described `.dtx` files in sequential and PRP modes.
+Their fixed record width comes from the header; `--record-bytes` remains a bin
+option. See [DTX format and usage](dtx-format.md).
