@@ -541,7 +541,8 @@ Stream<SparseBatch> *make_stream(VariantPtr cfg, int concurrency, const char *fi
     if (std::uint64_t(batch_size) * features.MAX_ACTIVE_FEATURES > INT_MAX)
         throw std::invalid_argument("Batch feature offsets exceed int32 capacity");
     auto source = open_indexed_training_data_source(filename, bytes, cfg);
-    auto skip = (shuffle || bytes != 72) ? make_prp_skip_predicate(filtered, skipping, seed, epoch)
+    bool legacy = source->legacy_packed();
+    auto skip = (shuffle || !legacy) ? make_prp_skip_predicate(filtered, skipping, seed, epoch)
                                          : make_skip_predicate(filtered, skipping);
     std::unique_ptr<BasicSfenInputStream> input;
     if (shuffle && block_size)
@@ -550,8 +551,8 @@ Stream<SparseBatch> *make_stream(VariantPtr cfg, int concurrency, const char *fi
     else if (shuffle)
         input = std::make_unique<PrpSfenInputStream>(std::move(source), seed, epoch, skip);
     else
-        input = std::make_unique<IndexedSequentialInputStream>(std::move(source), cyclic, skip, bytes == 72);
-    if (shuffle || bytes != 72)
+        input = std::make_unique<IndexedSequentialInputStream>(std::move(source), cyclic, skip, legacy);
+    if (shuffle || !legacy)
         return new PrpFeaturedBatchStream<RuntimeFeatures<F>, SparseBatch>(
             concurrency, batch_size, std::move(input), std::move(features));
     return new FeaturedBatchStream<RuntimeFeatures<F>, SparseBatch>(concurrency, batch_size, std::move(input),

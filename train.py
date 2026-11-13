@@ -73,11 +73,11 @@ def make_checkpoint_callback(save_top_k=10, **kwargs):
 
 def parse_args(argv=None):
   parser = argparse.ArgumentParser(description="Trains the network.")
-  parser.add_argument("train", help="Training data (.bin)")
-  parser.add_argument("val", help="Validation data (.bin)")
+  parser.add_argument("train", help="Training data (.bin or .dtx)")
+  parser.add_argument("val", help="Validation data (.bin or .dtx)")
   parser = pl.Trainer.add_argparse_args(parser)
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
-  parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for bin.")
+  parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Native workers for .bin and .dtx.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
   parser.add_argument("--seed", default=42, type=int, dest='seed', help="torch seed to use.")
@@ -94,7 +94,7 @@ def parse_args(argv=None):
     except ValueError as exc:
       raise argparse.ArgumentTypeError(str(exc)) from exc
   parser.add_argument('--record-bytes', type=record_bytes, default=72,
-                      help='Bytes per record in both input files, integer 7..144 (default: 72).')
+                      help='Bytes per .bin record, integer 7..144 (default: 72). DTX reads its width from the header.')
   parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping_deprecated', help="Enable smart fen skipping (default: enabled for sequential, disabled for PRP). --no-smart-fen-skipping takes precedence if both are supplied.")
   parser.add_argument("--no-smart-fen-skipping", action='store_true', default=None, dest='no_smart_fen_skipping', help="Disable smart fen skipping (default for PRP). Sequential enables it unless disabled explicitly.")
   parser.add_argument("--random-fen-skipping", default=None, type=int, dest='random_fen_skipping', help="Skip fens randomly on average this many before using one (default: 3 for sequential, 0 for PRP).")

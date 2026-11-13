@@ -89,7 +89,10 @@ class RecordBytesTest(unittest.TestCase):
             with self.subTest(size=size):
                 path=self.write(size)
                 self.assertEqual(data.training_data_record_count(path,size),137)
-                actual=self.collect(self.provider(path,size,num_workers=4))
+                # Legacy PackedSfen sequential workers can finish batches out of
+                # order. Compare physical record order with one legacy worker;
+                # retain four workers for every compact width.
+                actual=self.collect(self.provider(path,size,num_workers=1 if size==72 else 4))
                 for a,b in zip(actual,baseline):torch.testing.assert_close(a,b,rtol=0,atol=0)
 
     def test_prp_order_and_checkpoint_after_conversion(self):

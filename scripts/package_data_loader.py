@@ -18,7 +18,8 @@ def main():
         archive.writestr('README.txt',
             'Generic data-loader ABI 2. Extract the native library next to nnue_dataset.py.\n'
             'No per-variant compiler is required. Use --variant-config PATH to select JSON.\n'
-            'Keep a configured variant.json if you already have one.\n')
+            'Keep a configured variant.json if you already have one.\n'
+            'DTX record layout is read from its header; bin options are unchanged.\n')
         archive.writestr('SHA256SUMS',''.join(hashlib.sha256(path.read_bytes()).hexdigest()+'  '+name+'\n' for path,name in files))
 
 if __name__=='__main__':main()
