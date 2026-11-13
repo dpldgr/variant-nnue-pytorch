@@ -16,7 +16,7 @@ def main():
     with zipfile.ZipFile(args.output,'w',zipfile.ZIP_DEFLATED) as archive:
         for path,name in files:archive.write(path,name)
         archive.writestr('README.txt',
-            'Generic data-loader ABI 1. Extract the native library next to nnue_dataset.py.\n'
+            'Generic data-loader ABI 2. Extract the native library next to nnue_dataset.py.\n'
             'No per-variant compiler is required. Use --variant-config PATH to select JSON.\n'
             'Keep a configured variant.json if you already have one.\n')
         archive.writestr('SHA256SUMS',''.join(hashlib.sha256(path.read_bytes()).hexdigest()+'  '+name+'\n' for path,name in files))

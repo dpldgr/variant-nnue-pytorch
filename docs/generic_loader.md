@@ -3,7 +3,7 @@
 One prebuilt library handles all runtime variant configurations. End users do
 not need CMake, a C++ compiler, generated headers or a variant-specific DLL.
 Use the library for your operating system/architecture from the same Trainer
-revision; place it beside `nnue_dataset.py`. Runtime ABI 1 is checked on import.
+revision; place it beside `nnue_dataset.py`. Runtime ABI 2 is checked on import.
 The library is CPU-only and does not link to Python, PyTorch or CUDA.
 
 ```sh
@@ -15,6 +15,10 @@ The default is the bundled `variant.json`. `configs/metal-chess.json` uses the
 user-supplied Metal Chess piece values. All existing training options remain.
 PRP defaults to no smart or random skipping; sequential retains smart skipping
 and random skipping of 3. Explicit skipping options override these defaults.
+Buffered PRP bulk-reads 64 blocks of 16,384 records by default, then permutes all
+records across the buffer. `--prp-block-size` and `--prp-buffer-blocks` control
+these record-based dimensions; `--prp-mode global` retains the old random reader.
+Rebuild/install the ABI 2 library for this update. Sequential reads are unchanged.
 Record width 72 is PackedSfen; other widths in 7..144 use compact records.
 Formats remain headerless, so select the correct JSON and record width.
 
@@ -72,6 +76,11 @@ explicit `--variant-config`, `train.py` inherits it when resuming; `serialize.py
 also inherits it for checkpoint/model input. Explicit incompatible settings
 are rejected. Initialization values are preserved but do not define feature
 index identity. Keep the same `--features` selection when resuming/exporting.
+
+PRP checkpoints also retain their mode and buffer dimensions. Omitted options
+inherit these values; old PRP checkpoints retain global random reads. Add
+`--prp-mode buffered` explicitly when switching an existing run to bulk reads.
+Changes take effect at the next epoch boundary without omitting any records.
 
 Older checkpoints/models lack this metadata: supply their matching JSON (the
 bundled default applies if omitted). Legacy `.pt` feature objects are replaced

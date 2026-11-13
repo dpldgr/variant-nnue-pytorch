@@ -5,6 +5,7 @@
 #include <fstream>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -12,12 +13,23 @@ namespace training_data {
 class IndexedTrainingDataSource {
   public:
     using Index = std::uint64_t;
+    struct Range {
+        Index start, count;
+    };
     virtual Index record_count() const = 0;
     virtual VariantPtr config() const { return nullptr; }
     // Convenience view is valid until the next read. Batch readers supply
     // their own stable row storage through read_into().
     virtual bin::TrainingDataEntry read_record(Index index) = 0;
     virtual void read_into(Index index, bin::TrainingDataEntry &entry) { entry = read_record(index); }
+    // Storage owns the buffered representation. These indices are logical
+    // records; permutations and future backends need not know byte offsets.
+    virtual Index buffer_ranges(const std::vector<Range> &) {
+        throw std::runtime_error("Training-data backend does not support bulk reads");
+    }
+    virtual void read_buffered_into(Index, bin::TrainingDataEntry &) {
+        throw std::runtime_error("Training-data backend does not support buffered records");
+    }
     virtual ~IndexedTrainingDataSource() = default;
 };
 class BinIndexedTrainingDataSource final : public IndexedTrainingDataSource {
@@ -64,12 +76,49 @@ class BinIndexedTrainingDataSource final : public IndexedTrainingDataSource {
         if (!m_file.read(reinterpret_cast<char *>(m_buffer.data()), m_bytes))
             throw std::runtime_error("Failed to read indexed training record");
         m_next = index + 1;
+        decode_into(m_buffer.data(), entry);
+    }
+    Index buffer_ranges(const std::vector<Range> &ranges) override {
+        Index count = 0;
+        for (const auto &range : ranges) {
+            if (range.start > m_count || range.count > m_count - range.start || range.count > m_count - count)
+                throw std::out_of_range("Buffered range outside training dataset");
+            count += range.count;
+        }
+        if (count > std::numeric_limits<std::size_t>::max() / m_bytes ||
+            count > Index(std::numeric_limits<std::streamsize>::max()) / m_bytes)
+            throw std::length_error("PRP buffer exceeds addressable memory");
+        m_records.resize(std::size_t(count) * m_bytes);
+        std::size_t offset = 0;
+        for (const auto &range : ranges) {
+            if (!range.count)
+                continue;
+            if (range.start != m_next || range.start == 0)
+                m_file.seekg(static_cast<std::streamoff>(range.start * m_bytes));
+            auto bytes = std::size_t(range.count) * m_bytes;
+            if (!m_file.read(reinterpret_cast<char *>(m_records.data() + offset),
+                             static_cast<std::streamsize>(bytes)))
+                throw std::runtime_error("Failed to bulk-read training records");
+            offset += bytes;
+            m_next = range.start + range.count;
+        }
+        m_buffered_count = count;
+        return count;
+    }
+    void read_buffered_into(Index index, bin::TrainingDataEntry &entry) override {
+        if (index >= m_buffered_count)
+            throw std::out_of_range("Record index outside PRP buffer");
+        decode_into(m_records.data() + std::size_t(index) * m_bytes, entry);
+    }
+
+  private:
+    void decode_into(const std::uint8_t *record, bin::TrainingDataEntry &entry) {
         if (m_bytes == 72) {
-            bin::decode_packed72(m_buffer.data(), entry);
+            bin::decode_packed72(record, entry);
             return;
         }
         std::string error;
-        if (!m_codec.decode(m_buffer.data(), m_entry, error))
+        if (!m_codec.decode(record, m_entry, error))
             throw std::runtime_error("Invalid compact record: " + error);
         entry.pos.clear();
         entry.pos.turn = chess::Color(m_entry.turn);
@@ -88,9 +137,10 @@ class BinIndexedTrainingDataSource final : public IndexedTrainingDataSource {
     std::ifstream m_file;
     VariantPtr m_config;
     unsigned m_bytes;
-    Index m_count = 0, m_next = 0;
+    Index m_count = 0, m_next = 0, m_buffered_count = 0;
     bin::BatchStorage m_single;
     std::array<std::uint8_t, 144> m_buffer;
+    std::vector<std::uint8_t> m_records;
     CompactTrainingRecord::Codec m_codec;
     CompactTrainingRecord::Entry m_entry;
 };

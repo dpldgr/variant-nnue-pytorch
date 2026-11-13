@@ -25,8 +25,8 @@ except AttributeError as exc:
     raise RuntimeError('This is a variant-specific DLL; install the generic data-loader library.') from exc
 _version.restype = ctypes.c_uint
 _version.argtypes = []
-if _version() != 1:
-    raise RuntimeError('Incompatible generic data-loader ABI version')
+if _version() != 2:
+    raise RuntimeError('Incompatible generic data-loader ABI version; rebuild or install the ABI 2 library.')
 
 class SparseBatch(ctypes.Structure):
     _fields_ = [
@@ -145,6 +145,10 @@ _create = _bind('create_generic_batch_stream', ctypes.c_void_p,
     [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
      ctypes.c_bool, ctypes.c_bool, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64,
      ctypes.c_uint, ctypes.c_bool])
+_create_buffered = _bind('create_buffered_prp_batch_stream', ctypes.c_void_p,
+    [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+     ctypes.c_bool, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint,
+     ctypes.c_uint64, ctypes.c_uint])
 _fetch = _bind('fetch_next_generic_batch', SparseBatchPtr, [ctypes.c_void_p])
 _destroy_stream = _bind('destroy_sparse_batch_stream', None, [ctypes.c_void_p])
 _destroy_batch = _bind('destroy_sparse_batch', None, [SparseBatchPtr])
@@ -172,6 +176,19 @@ def validate_record_bytes(value):
     return value
 
 
+def prp_settings(prp_mode=None, prp_block_size=None, prp_buffer_blocks=None):
+    settings = dict(prp_mode='buffered' if prp_mode is None else prp_mode,
+                    prp_block_size=16384 if prp_block_size is None else prp_block_size,
+                    prp_buffer_blocks=64 if prp_buffer_blocks is None else prp_buffer_blocks)
+    if settings['prp_mode'] not in ('buffered', 'global'):
+        raise ValueError('PRP mode must be buffered or global')
+    for name, limit in (('prp_block_size', 1 << 64), ('prp_buffer_blocks', 1 << 32)):
+        value = settings[name]
+        if type(value) is not int or not 0 < value < limit:
+            raise ValueError(name.replace('_', '-') + ' must be a positive integer below ' + str(limit))
+    return settings
+
+
 def _checked_next(provider):
     batch = provider.fetch_next(provider.stream)
     if not batch:
@@ -189,15 +206,23 @@ def _checked_next(provider):
 
 class GenericBatchProvider(TrainingDataProvider):
     def __init__(self, feature_set, filename, batch_size, cyclic, num_workers, filtered,
-                 random_fen_skipping, device, record_bytes, config, seed=42, epoch=0, shuffle=False):
+                 random_fen_skipping, device, record_bytes, config, seed=42, epoch=0, shuffle=False,
+                 prp_mode=None, prp_block_size=None, prp_buffer_blocks=None):
         validate_record_bytes(record_bytes)
+        settings = prp_settings(prp_mode, prp_block_size, prp_buffer_blocks) if shuffle else None
         self.config = config or variant.default_config()
         self.native = NativeVariant(self.config)
         self.device, self.error = device, _error
         self.fetch_next, self.destroy_part, self.destroy_stream = _fetch, _destroy_batch, _destroy_stream
-        self.stream = _create(self.native.handle, feature_set.encode('utf-8'), num_workers,
-                              os.fsencode(filename), batch_size, cyclic, filtered, random_fen_skipping,
-                              seed % (1 << 64), epoch, record_bytes, shuffle)
+        if shuffle and settings['prp_mode'] == 'buffered':
+            self.stream = _create_buffered(self.native.handle, feature_set.encode('utf-8'), num_workers,
+                                          os.fsencode(filename), batch_size, filtered, random_fen_skipping,
+                                          seed % (1 << 64), epoch, record_bytes,
+                                          settings['prp_block_size'], settings['prp_buffer_blocks'])
+        else:
+            self.stream = _create(self.native.handle, feature_set.encode('utf-8'), num_workers,
+                                  os.fsencode(filename), batch_size, cyclic, filtered, random_fen_skipping,
+                                  seed % (1 << 64), epoch, record_bytes, shuffle)
         if not self.stream:
             message = _error().decode('utf-8', errors='replace')
             self.native.close()
@@ -262,9 +287,11 @@ def training_data_record_count(filename, record_bytes=72, config=None):
 
 class PrpSparseBatchProvider(GenericBatchProvider):
     def __init__(self, feature_set, filename, batch_size, num_workers=1, filtered=False,
-                 random_fen_skipping=0, device='cpu', seed=42, epoch=0, record_bytes=72, config=None):
+                 random_fen_skipping=0, device='cpu', seed=42, epoch=0, record_bytes=72, config=None,
+                 prp_mode=None, prp_block_size=None, prp_buffer_blocks=None):
         super().__init__(feature_set, filename, batch_size, False, num_workers, filtered,
-                         random_fen_skipping, device, record_bytes, config, seed, epoch, True)
+                         random_fen_skipping, device, record_bytes, config, seed, epoch, True,
+                         prp_mode, prp_block_size, prp_buffer_blocks)
 
 
 class PrpBatchDataset(torch.utils.data.IterableDataset):
@@ -274,7 +301,8 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
     batches. Record counting and reads are delegated to the storage backend.
     """
     def __init__(self, feature_set, filename, batch_size, num_workers=1,
-                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, record_bytes=72, config=None):
+                 filtered=False, random_fen_skipping=0, device='cpu', seed=42, record_bytes=72, config=None,
+                 prp_mode=None, prp_block_size=None, prp_buffer_blocks=None):
         super().__init__()
         if batch_size < 1 or num_workers < 1 or random_fen_skipping < 0:
             raise ValueError('PRP requires positive batch size/workers and nonnegative skipping.')
@@ -288,6 +316,9 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         self.seed = seed % (1 << 64)
         self.record_bytes = validate_record_bytes(record_bytes)
         self.config = config or variant.default_config()
+        self._prp_overrides = dict(prp_mode=prp_mode, prp_block_size=prp_block_size,
+                                  prp_buffer_blocks=prp_buffer_blocks)
+        self.prp_settings = prp_settings(**self._prp_overrides)
         self.record_count = training_data_record_count(filename, record_bytes, self.config)
         self.next_epoch = 0
         self.epoch_complete = True
@@ -302,7 +333,8 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
         self.epoch_complete = False
         provider = PrpSparseBatchProvider(
             self.feature_set, self.filename, self.batch_size, self.num_workers,
-            self.filtered, self.random_fen_skipping, self.device, self.seed, epoch, self.record_bytes, self.config)
+            self.filtered, self.random_fen_skipping, self.device, self.seed, epoch, self.record_bytes,
+            self.config, **self.prp_settings)
         try:
             yield from provider
             self.epoch_complete = True
@@ -310,23 +342,35 @@ class PrpBatchDataset(torch.utils.data.IterableDataset):
             provider.close()
 
     def state_dict(self):
-        return dict(version=1, next_epoch=self.next_epoch, epoch_complete=self.epoch_complete, seed=self.seed,
+        return dict(version=2, next_epoch=self.next_epoch, epoch_complete=self.epoch_complete, seed=self.seed,
                     record_count=self.record_count, batch_size=self.batch_size,
                     feature_set=self.feature_set, filtered=self.filtered,
-                    random_fen_skipping=self.random_fen_skipping, record_bytes=self.record_bytes, variant_config=self.config.to_dict())
+                    random_fen_skipping=self.random_fen_skipping, record_bytes=self.record_bytes,
+                    variant_config=self.config.to_dict(), **self.prp_settings)
 
     def load_state_dict(self, state):
+        version = state.get('version', 1)
+        if version not in (1, 2):
+            raise ValueError('Unsupported PRP checkpoint version')
         if not state.get('epoch_complete', False):
             raise ValueError('PRP resumption currently requires a completed-epoch checkpoint.')
         if 'variant_config' in state and not self.config.compatible_with(variant.VariantConfig.from_dict(state['variant_config'])):
             raise ValueError('PRP checkpoint does not match current variant configuration')
         expected = self.state_dict()
+        if version == 2 and not all(key in state for key in self._prp_overrides):
+            raise ValueError('PRP checkpoint is missing its read strategy settings')
+        saved_prp = (prp_settings(prp_mode='global') if version == 1 else
+                     prp_settings(**{key: state[key] for key in self._prp_overrides}))
+        resumed_prp = prp_settings(**{key: saved_prp[key] if value is None else value
+                                     for key, value in self._prp_overrides.items()})
         for key in expected:
             # A lossless conversion can change record width without changing
             # logical positions or permutation state. Legacy states omit it.
-            if key not in ('next_epoch', 'epoch_complete', 'record_bytes', 'variant_config') and state.get(key) != expected[key]:
+            if key not in ('version', 'next_epoch', 'epoch_complete', 'record_bytes', 'variant_config',
+                           *self._prp_overrides) and state.get(key) != expected[key]:
                 raise ValueError('PRP checkpoint does not match current loader setting: ' + key)
         self.next_epoch = int(state['next_epoch'])
         if self.next_epoch < 0:
             raise ValueError('Invalid PRP checkpoint epoch.')
+        self.prp_settings = resumed_prp
         self.epoch_complete = True

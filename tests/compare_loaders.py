@@ -53,7 +53,7 @@ def main():
                 reference=Reference(folder,feature,folder/'positions.bin',shuffle,workers)
                 cls=data.PrpSparseBatchProvider if shuffle else data.SparseBatchProvider
                 kwargs=dict(config=config,num_workers=workers)
-                if shuffle:kwargs.update(seed=17,epoch=3)
+                if shuffle:kwargs.update(seed=17,epoch=3,prp_mode='global')
                 else:kwargs.update(cyclic=False)
                 provider=cls(feature,str(folder/'positions.bin'),32,**kwargs)
                 count=0

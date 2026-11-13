@@ -94,9 +94,9 @@ class RecordBytesTest(unittest.TestCase):
 
     def test_prp_order_and_checkpoint_after_conversion(self):
         legacy=self.write(72);small=self.write(7)
-        expected=self.collect(self.provider(legacy,72,shuffle=True,num_workers=1,seed=17,epoch=2))
+        expected=self.collect(self.provider(legacy,72,shuffle=True,num_workers=1,seed=17,epoch=2,prp_block_size=17,prp_buffer_blocks=3))
         for size in (7,8,9,25,73,144):
-            actual=self.collect(self.provider(self.write(size),size,shuffle=True,num_workers=4,seed=17,epoch=2))
+            actual=self.collect(self.provider(self.write(size),size,shuffle=True,num_workers=4,seed=17,epoch=2,prp_block_size=17,prp_buffer_blocks=3))
             for a,b in zip(actual,expected):torch.testing.assert_close(a,b,rtol=0,atol=0)
         old=data.PrpBatchDataset('HalfKAv2',legacy,32)
         list(old);state=old.state_dict()

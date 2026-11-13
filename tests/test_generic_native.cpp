@@ -36,8 +36,11 @@ int main() {
         for (unsigned iteration = 0; iteration < 30; ++iteration) {
             auto *ctx = create_variant_context(8, 8, 6, 32, 64, 0);
             check(ctx, "context failed");
-            auto *stream = create_generic_batch_stream(ctx, "HalfKAv2^", 4, name.c_str(), 2, false, false, 0,
-                                                       17, 3, 8, true);
+            auto *stream = iteration % 2
+                ? create_buffered_prp_batch_stream(ctx, "HalfKAv2^", 4, name.c_str(), 2, false, 0,
+                                                    17, 3, 8, 17, 3)
+                : create_generic_batch_stream(ctx, "HalfKAv2^", 4, name.c_str(), 2, false, false, 0,
+                                                17, 3, 8, true);
             check(stream, "stream failed");
             destroy_variant_context(ctx);
             unsigned count = 0;

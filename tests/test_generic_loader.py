@@ -120,3 +120,24 @@ PIECE_VALUES = {1: 126, 2: 2538, 3: 1506, 4: 1166, 5: 1093}
             try:
                 with self.assertRaises(RuntimeError):next(p)
             finally:p.close()
+
+    def test_buffered_records_keep_features_and_targets_together(self):
+        for name, values in PROFILES.items():
+            cfg = variant.VariantConfig.from_dict(values)
+            path = self.root / (name+'.bin')
+            write(path, values)
+            for family in ('HalfKP','HalfKP^','HalfKA','HalfKA^','HalfKAv2','HalfKAv2^'):
+                if name == 'no-reference' and family.startswith('HalfKP'):
+                    continue
+                results = []
+                for mode in ('global','buffered'):
+                    provider = data.PrpSparseBatchProvider(family, str(path), 32, num_workers=4,
+                                                         config=cfg, prp_mode=mode,
+                                                         prp_block_size=7, prp_buffer_blocks=3)
+                    try:batches = list(provider)
+                    finally:provider.close()
+                    tensors = [torch.cat([b[i] for b in batches]) for i in range(10)]
+                    order = tensors[7].flatten().argsort()
+                    results.append([t[order] for t in tensors])
+                for a,b in zip(*results):
+                    torch.testing.assert_close(a,b,rtol=0,atol=0,msg=f'{name} {family}')

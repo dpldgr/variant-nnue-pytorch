@@ -29,14 +29,24 @@ class PrpLoaderState(pl.Callback):
     if self.state_key not in checkpoint.get('callbacks', {}):
       raise ValueError('PRP checkpoint has no loader state. Use a PRP epoch-boundary checkpoint, or initialize weights with --resume-from-model.')
 
+  def on_train_start(self, trainer, pl_module):
+    settings = self.dataset.prp_settings
+    if settings['prp_mode'] == 'buffered':
+      pl_module.print('PRP reads: buffered, {} records/block, {} blocks/buffer'.format(
+          settings['prp_block_size'], settings['prp_buffer_blocks']))
+    else:
+      pl_module.print('PRP reads: global per-record random access')
 
-def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size, data_loader='sequential', seed=42, record_bytes=72):
+
+def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size, data_loader='sequential', seed=42, record_bytes=72, prp_mode=None, prp_block_size=None, prp_buffer_blocks=None):
   features_name = feature_set.name
   config = getattr(feature_set, "config", None)
   if data_loader == 'prp':
     dataset = nnue_dataset.PrpBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
                                           filtered=filtered, random_fen_skipping=random_fen_skipping,
-                                          device=main_device, seed=seed, record_bytes=record_bytes, config=config)
+                                          device=main_device, seed=seed, record_bytes=record_bytes, config=config,
+                                          prp_mode=prp_mode, prp_block_size=prp_block_size,
+                                          prp_buffer_blocks=prp_buffer_blocks)
     if epoch_size is not None and epoch_size != dataset.record_count:
       raise ValueError('--epoch-size must match the dataset record count ({}) with --data-loader prp.'.format(dataset.record_count))
     train = DataLoader(dataset, batch_size=None, batch_sampler=None)
@@ -72,6 +82,12 @@ def parse_args(argv=None):
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
   parser.add_argument("--seed", default=42, type=int, dest='seed', help="torch seed to use.")
   parser.add_argument("--data-loader", choices=('sequential', 'prp'), default='sequential', help="Training record order. Default: sequential. PRP traverses the whole dataset once per epoch.")
+  parser.add_argument('--prp-mode', choices=('buffered', 'global'), default=None,
+                      help='PRP read strategy (default: buffered; inherit on resume). Global performs the original per-record random reads.')
+  parser.add_argument('--prp-block-size', type=int, default=None,
+                      help='Records per contiguous PRP read block (default: 16384; inherit on resume).')
+  parser.add_argument('--prp-buffer-blocks', type=int, default=None,
+                      help='Blocks mixed in each PRP buffer (default: 64; inherit on resume).')
   def record_bytes(text):
     try:
       return nnue_dataset.validate_record_bytes(int(text))
@@ -92,6 +108,10 @@ def parse_args(argv=None):
   args = parser.parse_args(argv)
   if args.save_top_k < -1:
     parser.error('--save-top-k must be -1 or a nonnegative integer')
+  try:
+    nnue_dataset.prp_settings(args.prp_mode, args.prp_block_size, args.prp_buffer_blocks)
+  except ValueError as exc:
+    parser.error(str(exc))
   if args.no_smart_fen_skipping is None:
     args.no_smart_fen_skipping = args.data_loader == 'prp' and not args.smart_fen_skipping_deprecated
   if args.random_fen_skipping is None:
@@ -151,7 +171,7 @@ def main():
   main_device = trainer.strategy.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
 
   print('Using c++ data loader ({})'.format(args.data_loader))
-  train, val = make_data_loaders(args.train, args.val, feature_set, args.num_workers, batch_size, not args.no_smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.validation_size, args.data_loader, args.seed, args.record_bytes)
+  train, val = make_data_loaders(args.train, args.val, feature_set, args.num_workers, batch_size, not args.no_smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.validation_size, args.data_loader, args.seed, args.record_bytes, args.prp_mode, args.prp_block_size, args.prp_buffer_blocks)
   if args.data_loader == 'prp':
     trainer.callbacks.append(PrpLoaderState(train.dataset))
 

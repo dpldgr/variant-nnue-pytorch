@@ -106,9 +106,51 @@ class PrpLoaderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'seed'):
             self.dataset(seed=99, random_fen_skipping=3).load_state_dict(state)
 
+    def test_buffer_groups_partial_blocks_and_worker_order(self):
+        expected, sizes = collect(self.provider(num_workers=1, prp_block_size=17, prp_buffer_blocks=3))
+        self.assertEqual(sorted(expected), list(range(257)))
+        self.assertEqual(sizes, [64]*4+[1])
+        for workers in (2,4,8):
+            actual, sizes = collect(self.provider(num_workers=workers, prp_block_size=17, prp_buffer_blocks=3))
+            self.assertEqual(actual, expected)
+            self.assertEqual(sizes, [64]*4+[1])
+        other, _ = collect(self.provider(epoch=1, prp_block_size=17, prp_buffer_blocks=3))
+        self.assertNotEqual(other, expected)
+        filtered, sizes = collect(self.provider(random_fen_skipping=3, prp_block_size=17, prp_buffer_blocks=3))
+        self.assertEqual(len(filtered), len(set(filtered)))
+        self.assertTrue(all(n==64 for n in sizes[:-1]))
+
+    def test_saved_read_settings_and_legacy_global_resume(self):
+        original = self.dataset(prp_block_size=17, prp_buffer_blocks=3)
+        list(original)
+        state = original.state_dict()
+        restored = self.dataset(num_workers=4)
+        restored.load_state_dict(state)
+        self.assertEqual(restored.prp_settings, original.prp_settings)
+        expected = [b[7] for b in original]
+        actual = [b[7] for b in restored]
+        for a,b in zip(actual,expected):torch.testing.assert_close(a,b,rtol=0,atol=0)
+        legacy = dict(state, version=1)
+        for key in original.prp_settings:legacy.pop(key)
+        restored = self.dataset()
+        restored.load_state_dict(legacy)
+        self.assertEqual(restored.prp_settings['prp_mode'], 'global')
+        expected, _ = collect(self.provider(prp_mode='global', epoch=1))
+        actual = [int(x) for b in restored for x in b[7].flatten().tolist()]
+        self.assertEqual(actual,expected)
+        switched = self.dataset(prp_mode='buffered', prp_block_size=17, prp_buffer_blocks=3)
+        switched.load_state_dict(legacy)
+        self.assertEqual(switched.prp_settings['prp_mode'],'buffered')
+        self.assertEqual(sum(len(b[7]) for b in switched),257)
+
+    def test_invalid_buffer_configuration(self):
+        for settings in (dict(prp_mode='unknown'),dict(prp_block_size=0),dict(prp_buffer_blocks=-1),
+                         dict(prp_block_size=1<<64),dict(prp_buffer_blocks=1<<32)):
+            with self.subTest(settings=settings),self.assertRaises(ValueError):self.dataset(**settings)
+
     def test_early_close_joins_prefetch_workers(self):
         for _ in range(10):
-            provider = self.provider(num_workers=8)
+            provider = self.provider(num_workers=8, prp_block_size=17, prp_buffer_blocks=3)
             self.assertEqual(len(next(provider)[7]), 64)
             provider.close()
             provider.close()

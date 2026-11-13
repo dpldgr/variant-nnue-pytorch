@@ -195,11 +195,30 @@ To shuffle records as they are read, without rewriting the dataset:
 python train.py train_data.bin val_data.bin --data-loader prp
 ```
 
-Rebuild the existing data-loader library before selecting `prp`; there is no
-additional library. PRP uses a six-round Feistel permutation with cycle walking
-to visit every source record exactly once per epoch. `--seed` and the epoch
-number determine the order. Feature workers may finish out of order, but their
-batches are delivered in permutation order, independent of `--num-workers`.
+Rebuild or install the **ABI 2** generic data-loader library after updating;
+there is no additional library. PRP now defaults to buffered disk access:
+
+- Divide the file into contiguous blocks of **16,384 records**.
+- Select **64 blocks** with an outer PRP and bulk-read them in file order.
+- Apply an inner PRP across all actual records in that buffer, mixing positions
+  across blocks before forming training batches.
+
+At 72 bytes/record this uses a 72 MiB raw-record buffer. Adjust it with
+`--prp-block-size N` (records/block) and `--prp-buffer-blocks N`. This is separate
+from `--batch-size`; smaller records use proportionally less buffer memory.
+The short last disk block is shuffled normally and only its actual records are
+read. Training batches span buffer boundaries; only the epoch's final batch can
+be short. Buffers are reused, with no decoded board allocation per record.
+
+This is a hierarchical shuffle: records mix across a selected group rather than
+the entire dataset at once. Groups and their permutations change each epoch.
+Use `--prp-mode global` to reproduce the original global per-record PRP for
+comparison, or `--prp-mode buffered` to select bulk reads explicitly.
+
+Both modes use six-round Feistel permutations with cycle walking and visit every
+source record exactly once per epoch. `--seed` and the epoch determine the order.
+Feature workers may finish out of order, but their batches are delivered in
+permutation order, independent of `--num-workers`.
 
 One PRP epoch is one complete dataset traversal. The final batch can be smaller;
 it never wraps into the next epoch. Omit `--epoch-size` for automatic counting,
@@ -220,13 +239,17 @@ trainer process (CPU or GPU), with native worker threads for feature extraction.
 
 Epoch-boundary checkpoints save the next permutation epoch and its configuration.
 Resume with the same dataset contents, seed, batch size, features and filtering
-settings. `--num-workers` may change. Mid-epoch checkpoints are rejected on resume
+settings. Omitted PRP mode/block/buffer options inherit checkpoint settings;
+old checkpoints inherit their original `global` mode. To switch an existing run
+to bulk reads, explicitly add `--prp-mode buffered`. Explicit block/buffer changes
+also apply from the next complete epoch. `--num-workers` may change.
+Mid-epoch checkpoints are rejected on resume
 instead of silently skipping the remainder. A sequential checkpoint has no PRP
 state; `--resume-from-model` can initialize weights for a new PRP run instead.
 
 Record ordering uses logical indices through `IndexedTrainingDataSource`.
 The initial `.bin` backend owns file sizing, fixed-width offsets and decoding,
-using the selected record width and compiled variant schema. Future variable-size
+using the selected record width and runtime variant schema. Future variable-size
 or compressed backends can implement indexed lookup without changing the PRP,
 epoch or batching layers. Malformed, empty and unsupported files are rejected.
 

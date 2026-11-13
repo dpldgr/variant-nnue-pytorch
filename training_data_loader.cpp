@@ -535,7 +535,8 @@ using namespace training_data;
 template <Family F>
 Stream<SparseBatch> *make_stream(VariantPtr cfg, int concurrency, const char *filename, int batch_size,
                                  bool cyclic, bool filtered, int skipping, std::uint64_t seed,
-                                 std::uint64_t epoch, unsigned bytes, bool shuffle) {
+                                 std::uint64_t epoch, unsigned bytes, bool shuffle,
+                                 std::uint64_t block_size = 0, unsigned buffer_blocks = 0) {
     RuntimeFeatures<F> features(cfg);
     if (std::uint64_t(batch_size) * features.MAX_ACTIVE_FEATURES > INT_MAX)
         throw std::invalid_argument("Batch feature offsets exceed int32 capacity");
@@ -543,7 +544,10 @@ Stream<SparseBatch> *make_stream(VariantPtr cfg, int concurrency, const char *fi
     auto skip = (shuffle || bytes != 72) ? make_prp_skip_predicate(filtered, skipping, seed, epoch)
                                          : make_skip_predicate(filtered, skipping);
     std::unique_ptr<BasicSfenInputStream> input;
-    if (shuffle)
+    if (shuffle && block_size)
+        input = std::make_unique<BufferedPrpSfenInputStream>(std::move(source), seed, epoch, block_size,
+                                                             buffer_blocks, skip);
+    else if (shuffle)
         input = std::make_unique<PrpSfenInputStream>(std::move(source), seed, epoch, skip);
     else
         input = std::make_unique<IndexedSequentialInputStream>(std::move(source), cyclic, skip, bytes == 72);
@@ -554,7 +558,7 @@ Stream<SparseBatch> *make_stream(VariantPtr cfg, int concurrency, const char *fi
                                                                     std::move(features));
 }
 extern "C" {
-EXPORT unsigned CDECL get_loader_abi_version() { return 1; }
+EXPORT unsigned CDECL get_loader_abi_version() { return 2; }
 EXPORT const char *CDECL get_prp_last_error() { return prp_last_error.c_str(); }
 EXPORT ConfigHandle *CDECL create_variant_context(unsigned files, unsigned ranks, unsigned types,
                                                   unsigned pieces, unsigned kings, unsigned pockets) {
@@ -579,9 +583,11 @@ EXPORT std::uint64_t CDECL generic_record_count(ConfigHandle *h, const char *fil
         return 0;
     }
 }
-EXPORT Stream<SparseBatch> *CDECL create_generic_batch_stream(
-    ConfigHandle *h, const char *feature, int concurrency, const char *filename, int batch_size, bool cyclic,
-    bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch, unsigned bytes, bool shuffle) {
+static Stream<SparseBatch> *create_stream_impl(ConfigHandle *h, const char *feature, int concurrency,
+                                               const char *filename, int batch_size, bool cyclic,
+                                               bool filtered, int skipping, std::uint64_t seed,
+                                               std::uint64_t epoch, unsigned bytes, bool shuffle,
+                                               std::uint64_t block_size, unsigned buffer_blocks) {
     prp_last_error.clear();
     try {
         if (!h || !feature || !filename || concurrency < 1 || batch_size < 1 || skipping < 0 ||
@@ -590,27 +596,44 @@ EXPORT Stream<SparseBatch> *CDECL create_generic_batch_stream(
         std::string_view name(feature);
         if (name == "HalfKP")
             return make_stream<Family::KP>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
-                                           seed, epoch, bytes, shuffle);
+                                           seed, epoch, bytes, shuffle, block_size, buffer_blocks);
         if (name == "HalfKP^")
             return make_stream<Family::KPF>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
-                                            seed, epoch, bytes, shuffle);
+                                            seed, epoch, bytes, shuffle, block_size, buffer_blocks);
         if (name == "HalfKA")
             return make_stream<Family::KA>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
-                                           seed, epoch, bytes, shuffle);
+                                           seed, epoch, bytes, shuffle, block_size, buffer_blocks);
         if (name == "HalfKA^")
             return make_stream<Family::KAF>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
-                                            seed, epoch, bytes, shuffle);
+                                            seed, epoch, bytes, shuffle, block_size, buffer_blocks);
         if (name == "HalfKAv2")
             return make_stream<Family::V2>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
-                                           seed, epoch, bytes, shuffle);
+                                           seed, epoch, bytes, shuffle, block_size, buffer_blocks);
         if (name == "HalfKAv2^")
             return make_stream<Family::V2F>(*h, concurrency, filename, batch_size, cyclic, filtered, skipping,
-                                            seed, epoch, bytes, shuffle);
+                                            seed, epoch, bytes, shuffle, block_size, buffer_blocks);
         throw std::invalid_argument("Unknown feature_set: " + std::string(name));
     } catch (const std::exception &e) {
         prp_last_error = e.what();
         return nullptr;
     }
+}
+EXPORT Stream<SparseBatch> *CDECL create_generic_batch_stream(
+    ConfigHandle *h, const char *feature, int concurrency, const char *filename, int batch_size, bool cyclic,
+    bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch, unsigned bytes, bool shuffle) {
+    return create_stream_impl(h, feature, concurrency, filename, batch_size, cyclic, filtered, skipping, seed,
+                              epoch, bytes, shuffle, 0, 0);
+}
+EXPORT Stream<SparseBatch> *CDECL create_buffered_prp_batch_stream(
+    ConfigHandle *h, const char *feature, int concurrency, const char *filename, int batch_size,
+    bool filtered, int skipping, std::uint64_t seed, std::uint64_t epoch, unsigned bytes,
+    std::uint64_t block_size, unsigned buffer_blocks) {
+    if (!block_size || !buffer_blocks) {
+        prp_last_error = "PRP block size and buffer block count must be positive";
+        return nullptr;
+    }
+    return create_stream_impl(h, feature, concurrency, filename, batch_size, false, filtered, skipping, seed,
+                              epoch, bytes, true, block_size, buffer_blocks);
 }
 EXPORT SparseBatch *CDECL fetch_next_generic_batch(Stream<SparseBatch> *stream) {
     prp_last_error.clear();

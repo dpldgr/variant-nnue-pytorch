@@ -26,6 +26,19 @@ public:
         return entry;
     }
     std::vector<Index> visited;
+    Index buffer_ranges(const std::vector<Range>& ranges) override {
+        buffered.clear();
+        for (const auto& range : ranges) {
+            check(range.start < m_count && range.count <= m_count-range.start,"invalid bulk range");
+            for (Index i=0;i<range.count;++i) buffered.push_back(range.start+i);
+        }
+        loads.push_back(buffered.size());
+        return buffered.size();
+    }
+    void read_buffered_into(Index index, bin::TrainingDataEntry& entry) override {
+        entry=read_record(buffered.at(index));
+    }
+    std::vector<Index> buffered,loads;
 private:
     Index m_count;
 };
@@ -86,6 +99,34 @@ int main() {
         PrpSfenInputStream all_skipped(std::make_unique<MemorySource>(17), 42, 0,
             [](const bin::TrainingDataEntry&) { return true; });
         check(!all_skipped.next() && all_skipped.eof(), "all-skipped epoch did not finish");
+        for (Index count : {1,2,7,64,65,257})
+            for (Index block : {1,7,64,512})
+                for (unsigned groups : {1,3,64})
+                    for (bool skip : {false,true}) {
+                        auto source=std::make_unique<MemorySource>(count);
+                        auto* observed=source.get();
+                        BufferedPrpSfenInputStream stream(std::move(source),42,7,block,groups,
+                            [skip](const bin::TrainingDataEntry& e){return skip && e.score%3==0;});
+                        std::vector<int> actual;
+                        std::vector<std::size_t> sizes;
+                        for (;;) {
+                            std::vector<bin::TrainingDataEntry> batch;
+                            stream.fill(batch,17);
+                            if(batch.empty()) break;
+                            sizes.push_back(batch.size());
+                            for(const auto& e:batch) actual.push_back(e.score);
+                        }
+                        std::sort(actual.begin(),actual.end());
+                        std::vector<int> expected;
+                        for(Index i=0;i<count;++i) if(!skip || i%3) expected.push_back(int(i));
+                        check(actual==expected,"buffered PRP dropped or repeated a record");
+                        check(observed->visited.size()==count,"buffered filtering missed a record");
+                        check(std::all_of(observed->loads.begin(),observed->loads.end(),
+                            [&](Index n){return n>0 && n<=block*groups;}),"buffer size exceeded");
+                        for(std::size_t i=0;i+1<sizes.size();++i)
+                            check(sizes[i]==17,"short training batch at a buffer boundary");
+                        check(stream.eof() && !stream.next(),"buffered epoch did not finish");
+                    }
         int legacy_calls=0;
         IndexedSequentialInputStream legacy(std::make_unique<MemorySource>(3),true,
             [&](const bin::TrainingDataEntry&){return ++legacy_calls<6;},true);
